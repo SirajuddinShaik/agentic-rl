@@ -1,0 +1,1 @@
+import "@/ingestion/autoscaler/runner"

@@ -1,0 +1,25 @@
+# Xyne SGLang topology stub (cluster phase).
+# Schema mirrors examples/calculator/topology.sgl.yaml but with a single
+# gateway node + a single SGLang inference engine. Stub for the later
+# Megatron/SGLang distributed cluster milestone: the model id need not exist
+# yet (only validated when the topology loader actually starts the engine).
+rollout:
+  host: 127.0.0.1
+  port: 8080
+  public_url: http://127.0.0.1:8080
+  save_dir: ./rollout_results
+
+gateway:
+  heartbeat_interval_seconds: 30
+  nodes:
+    - id: localhost-node-xyne
+      host: 127.0.0.1
+      port: 8100
+      public_url: http://127.0.0.1:8100
+      max_init_workers: 8
+      max_run_workers: 8
+      max_postrun_workers: 8
+      model_served: nemotron-30b-a3b
+      inference:
+        engine: sglang
+        base_url: http://127.0.0.1:8000

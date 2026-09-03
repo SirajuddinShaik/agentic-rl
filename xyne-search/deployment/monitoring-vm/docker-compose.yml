@@ -1,0 +1,150 @@
+name: xyne-monitoring-vm
+
+services:
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:latest}
+    container_name: xyne-prometheus
+    restart: unless-stopped
+    user: ${PROMETHEUS_USER:-root}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${PROMETHEUS_DATA_DIR:-/opt/monitoring/prometheus}:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - monitoring
+      - xyne_app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    container_name: xyne-grafana
+    restart: unless-stopped
+    user: ${GRAFANA_USER:-root}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_METRICS_ENABLED: "true"
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+      - ${GRAFANA_DATA_DIR:-/opt/monitoring/grafana}:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3002}:3000"
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+      - loki
+
+  loki:
+    image: ${LOKI_IMAGE:-grafana/loki:3.4.1}
+    container_name: xyne-loki
+    restart: unless-stopped
+    user: ${LOKI_USER:-root}
+    command: --config.file=/etc/loki/loki.yml
+    volumes:
+      - ./loki.yml:/etc/loki/loki.yml:ro
+      - ${LOKI_DATA_DIR:-/opt/monitoring/loki}:/loki
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    networks:
+      - monitoring
+
+  alloy:
+    image: ${ALLOY_IMAGE:-grafana/alloy:latest}
+    container_name: xyne-alloy
+    restart: unless-stopped
+    user: root
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ${ALLOY_DATA_DIR:-/opt/monitoring/alloy}:/var/lib/alloy/data
+    ports:
+      - "${ALLOY_PORT:-12345}:12345"
+    networks:
+      - monitoring
+    depends_on:
+      - loki
+
+  cadvisor:
+    image: ${CADVISOR_IMAGE:-gcr.io/cadvisor/cadvisor:latest}
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --storage_duration=2m
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    ports:
+      - "${CADVISOR_PORT:-8082}:8080"
+    networks:
+      - monitoring
+
+  node-exporter:
+    image: ${NODE_EXPORTER_IMAGE:-prom/node-exporter:latest}
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($$|/)
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "${NODE_EXPORTER_PORT:-9100}:9100"
+    networks:
+      - monitoring
+
+  postgres-exporter:
+    image: ${POSTGRES_EXPORTER_IMAGE:-prometheuscommunity/postgres-exporter:latest}
+    container_name: postgres-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_EXPORTER_USER:-xyne}:${POSTGRES_EXPORTER_PASSWORD:-xyne}@${POSTGRES_EXPORTER_HOST:-xyne-db}:${POSTGRES_EXPORTER_PORT:-5432}/${POSTGRES_EXPORTER_DB:-xyne}?sslmode=disable"
+      PG_EXPORTER_WEB_LISTEN_ADDRESS: ":9187"
+    ports:
+      - "${POSTGRES_EXPORTER_WEB_PORT:-9187}:9187"
+    networks:
+      - monitoring
+      - xyne_app
+
+  redis-exporter:
+    image: ${REDIS_EXPORTER_IMAGE:-oliver006/redis_exporter:latest}
+    container_name: redis-exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: ${REDIS_EXPORTER_ADDR:-redis://redis:6379/0}
+    ports:
+      - "${REDIS_EXPORTER_PORT:-9121}:9121"
+    networks:
+      - monitoring
+      - xyne_app
+
+networks:
+  monitoring:
+    driver: bridge
+  xyne_app:
+    external: true
+    name: ${XYNE_DOCKER_NETWORK:-xyne-stack_xyne}

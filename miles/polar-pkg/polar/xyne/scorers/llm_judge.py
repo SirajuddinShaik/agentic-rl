@@ -1,0 +1,505 @@
+"""LLM-judge scorer: score via a configurable external judge endpoint.
+
+This is the ONLY scorer permitted to make a network call. It POSTs the
+question, answer and citations to an OpenAI-compatible ``/v1/chat/completions``
+endpoint and runs **four async judge dimensions** — ``quality``, ``correctness``,
+``groundedness`` and ``citation_accuracy`` — each returning one of ``0.0``,
+``0.5`` or ``1.0``, then aggregates them into a single composite in ``[0, 1]``. It
+never calls Xyne, and it never raises out of ``score`` — any HTTP, parsing, or
+configuration problem yields ``0.0``.
+
+Concurrency
+-----------
+The four dimension calls are dispatched concurrently via a shared
+``asyncio.Semaphore`` (default capacity 20). The sync :meth:`score` bridges to
+the async work internally so the synchronous ``RewardPipeline`` can keep using
+it unchanged. A clean async path (:meth:`score_async`) is also exposed for
+async callers (e.g. an evaluator) that want to ``await`` it and share an HTTP
+client.
+
+Config (via the scorer config dict):
+
+- ``judge_base_url`` (required): e.g. ``http://localhost:8080/v1``. The scorer
+  appends ``/chat/completions``. Empty/absent -> ``0.0`` (no judge configured).
+- ``judge_api_key``: bearer token, optional.
+- ``judge_model``: model name, default ``gpt-4o-mini``.
+- ``prompt_template``: format string with ``{question}``, ``{answer}``,
+  ``{citations}``, ``{reference}``, ``{dimension}`` and ``{rubric}``
+  placeholders.
+- ``timeout``: request timeout in seconds, default ``10.0``.
+- ``_transport``: an ``httpx.BaseTransport`` for unit tests (never passed in
+  production config) — lets tests inject a ``MockTransport`` with no network.
+- ``max_concurrency``: max concurrent judge HTTP calls (asyncio semaphore),
+  default ``20``.
+- ``dimension_weights``: ``{dim: weight}`` for the four dimensions; missing
+  dimensions default to ``1.0``.
+- ``enable_<dim>``: optional boolean toggle per dimension (``enable_quality``,
+  ...); default all enabled.
+
+The judge response for each dimension is expected as
+``choices[0].message.content`` containing a number. Missing/non-numeric content
+yields ``0.0`` for that dimension. The parsed score is clamped to ``[0.0, 1.0]``.
+The composite is the weighted average of the enabled dimensions; if all
+dimensions are disabled it is ``0.0``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import threading
+import httpx
+from math import isfinite
+
+from polar.xyne.reward_pipeline import XyneScorer, register_scorer
+from polar.xyne.types import XyneRawFlow
+
+__all__ = ["LLMJudgeScorer"]
+
+NAME = "llm_judge"
+
+# The four judge dimensions scored by this scorer, in evaluation order.
+DIMENSIONS = ("quality", "correctness", "groundedness", "citation_accuracy")
+
+DEFAULT_MAX_CONCURRENCY = 20
+DEFAULT_TIMEOUT = 10.0
+# Minimum max_tokens guard: the production judge (glm-flash-experimental)
+# emits a long reasoning_content (CoT) block before content, so a tiny cap
+# truncates before the final `Score:` and yields null content -> 0.0.
+DEFAULT_MAX_TOKENS = 16384
+_MIN_MAX_TOKENS = 64
+
+_JUDGE_SYSTEM_PROMPT = (
+    "You are an impartial, expert judge. Apply the most stringent standards "
+    "possible and show no leniency. You will evaluate an assistant's answer to "
+    "a user question together with the cited source snippets. Assess the answer "
+    "against a single specified dimension and return the score as one of exactly "
+    "0.0, 0.5, or 1.0 for that dimension (0.0 = bad, 0.5 = partial, 1.0 = good). "
+    "You may give at most one short sentence of justification. "
+    "Then return your score as the very last line of your response in exactly "
+    "this format: `Score: <0.0, 0.5, or 1.0>`. No other trailing text."
+)
+
+# Dimension-specific rubrics: what the judge should optimise for, in the style
+# of the gold-standard multi-dimensional judge in sglang's bench_other.py.
+DIMENSION_RUBRICS = {
+    "quality": (
+        "Quality: judge the overall quality of the answer — its clarity, "
+        "coherence, completeness, and how well it addresses the user's "
+        "question. A high-quality answer is clear, well-structured, complete, "
+        "and directly responsive. Penalise vague, rambling, or incomplete "
+        "answers."
+    ),
+    "correctness": (
+        "Correctness: judge the factual accuracy of the answer. When a "
+        "reference (ground-truth) answer is provided, compare against it; "
+        "otherwise judge against general factual correctness and internal "
+        "consistency. Penalise factual errors, unsupported claims, and "
+        "contradictions."
+    ),
+    "groundedness": (
+        "Groundedness: judge whether the answer stays grounded in the provided "
+        "cited snippets. Every substantive claim must be supported by the "
+        "citations. Penalise fabrication, hallucinated details, or claims that "
+        "cannot be traced back to the cited evidence."
+    ),
+    "citation_accuracy": (
+        "Citation accuracy: judge whether the answer's claims match and are "
+        "supported by the specific cited snippets. Penalise answers that cite "
+        "a source that does not actually support the claim, misquote the "
+        "snippet, or use citations loosely."
+    ),
+}
+
+DEFAULT_PROMPT_TEMPLATE = (
+    "User question: {question}\n\n"
+    "Assistant answer: {answer}\n\n"
+    "Cited snippets:\n{citations}\n"
+    "{reference}"
+    "\nDimension rubric ({dimension}):\n{rubric}"
+    "\n\nOUTPUT FORMAT (mandatory - enforced): Respond with AT MOST ONE short"
+    " sentence of justification, then a FINAL line containing ONLY the score"
+    " label in EXACTLY this form (no other trailing text):"
+    "\nScore: <0.0, 0.5, or 1.0>"
+    "\nA response that does not end with that exact line is rejected and scores 0.0."
+)
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+# A number appearing after a "Score:" / "score" label.
+_SCORE_LABEL_RE = re.compile(r"Score\s*:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _quantize(value: float) -> float:
+    """Snap a finite float to the nearest of {0.0, 0.5, 1.0}.
+
+    Clamps to ``[0.0, 1.0]`` first, then rounds to the nearest half via
+    ``round(value * 2) / 2.0`` (Python's round-half-even, which is
+    deterministic). The result is always one of ``0.0``, ``0.5``, or ``1.0``.
+    """
+    # Clamp first so out-of-range values snap to the boundary, not past it.
+    clamped = min(1.0, max(0.0, value))
+    return round(clamped * 2) / 2.0
+
+
+def _extract_score(text: str) -> float | None:
+    """Parse a float from the judge's text; return None if not parseable.
+
+    Prefers the (last) number following a ``Score:`` label — the intended
+    output contract — then falls back to a lone or first bare number. Returns
+    ``None`` (mapped to ``0.0`` by the caller) when nothing is parseable.
+    """
+    stripped = text.strip()
+    # Prefer the number on a trailing "Score: <num>" label; pick the LAST
+    # labeled number so the model's final score wins over justification text.
+    labeled = list(_SCORE_LABEL_RE.finditer(stripped))
+    if labeled:
+        match = labeled[-1]
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            value = None
+        if value is not None and isfinite(value):
+            return _quantize(value)
+
+    for candidate in (stripped, stripped.strip("`"), stripped.strip(".")):
+        try:
+            value = float(candidate)
+        except ValueError:
+            continue
+        if isfinite(value):
+            return _quantize(value)
+
+    match = _NUMBER_RE.search(stripped)
+    if match:
+        try:
+            value = float(match.group(0))
+        except ValueError:
+            return None
+        return _quantize(value) if isfinite(value) else None
+    return None
+
+
+@register_scorer(NAME)
+class LLMJudgeScorer(XyneScorer):
+    """Post Q+A+citations to a judge endpoint and return a composite score."""
+
+    name = NAME
+
+    def __init__(
+        self,
+        config: dict | None = None,
+        *,
+        weight: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
+        cfg = config or {}
+        super().__init__(
+            weight=float(cfg.get("weight", weight)),
+            enabled=bool(cfg.get("enabled", enabled)),
+        )
+        self._base_url = str(cfg.get("judge_base_url") or "").rstrip("/")
+        self._api_key = str(cfg.get("judge_api_key") or "")
+        self._model = str(cfg.get("judge_model") or "gpt-4o-mini")
+        self._prompt_template = str(
+            cfg.get("prompt_template") or DEFAULT_PROMPT_TEMPLATE
+        )
+        self._timeout = float(cfg.get("timeout", DEFAULT_TIMEOUT))
+        self._transport = cfg.get("_transport")
+
+        raw_max_tokens = cfg.get("max_tokens", DEFAULT_MAX_TOKENS)
+        try:
+            self._max_tokens = (
+                int(raw_max_tokens)
+                if raw_max_tokens not in (None, "")
+                else DEFAULT_MAX_TOKENS
+            )
+        except (TypeError, ValueError):
+            self._max_tokens = DEFAULT_MAX_TOKENS
+        if self._max_tokens < _MIN_MAX_TOKENS:
+            self._max_tokens = _MIN_MAX_TOKENS
+        # Local Nemotron judge can emit long reasoning before the final score.
+        # Raise legacy 2048/4096 task configs so citation/groundedness do not
+        # truncate to empty content.
+        if self._max_tokens < DEFAULT_MAX_TOKENS:
+            self._max_tokens = DEFAULT_MAX_TOKENS
+
+        raw_max_concurrency = cfg.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
+        try:
+            self._max_concurrency = (
+                int(raw_max_concurrency)
+                if raw_max_concurrency not in (None, "")
+                else DEFAULT_MAX_CONCURRENCY
+            )
+        except (TypeError, ValueError):
+            self._max_concurrency = DEFAULT_MAX_CONCURRENCY
+        if self._max_concurrency < 1:
+            self._max_concurrency = 1
+
+        # Per-dimension weights (default all 1.0).
+        raw_weights = cfg.get("dimension_weights")
+        self._dimension_weights: dict[str, float] = {}
+        if isinstance(raw_weights, dict):
+            for dim in DIMENSIONS:
+                raw = raw_weights.get(dim)
+                try:
+                    self._dimension_weights[dim] = (
+                        float(raw) if raw is not None else 1.0
+                    )
+                except (TypeError, ValueError):
+                    self._dimension_weights[dim] = 1.0
+        else:
+            self._dimension_weights = {dim: 1.0 for dim in DIMENSIONS}
+
+        # Per-dimension enable toggles (default all enabled).
+        self._enabled_dims: dict[str, bool] = {
+            dim: bool(cfg.get(f"enable_{dim}", True)) for dim in DIMENSIONS
+        }
+        # Raw per-dimension judge request/response for diagnostics (group dumps).
+        self._io: dict[str, dict] = {}
+
+    # -- prompt / request construction --------------------------------------
+
+    def _reference_answer(self, flow: XyneRawFlow) -> str:
+        """Return the reference/ground-truth answer if available (from metadata)."""
+        try:
+            ref = (
+                flow.metadata.get("reference_answer")
+                or flow.metadata.get("reference")
+                or flow.metadata.get("gold_answer")
+            )
+        except Exception:
+            return ""
+        return str(ref).strip() if ref else ""
+
+    def _build_dimension_body(self, flow: XyneRawFlow, dim: str) -> dict:
+        citations = _render_citations(flow.citations, flow=flow)
+        question = _first_question(flow.request_messages)
+        reference = self._reference_answer(flow)
+
+        # Build reference block with ground truth answer + gold doc/chunk IDs
+        gold_doc_ids = flow.metadata.get("expected_doc_ids") or flow.metadata.get("gold_doc_ids") or []
+        gold_chunk_ids = flow.metadata.get("expected_chunk_ids") or flow.metadata.get("gold_chunk_ids") or []
+        reference_parts = []
+        if reference:
+            reference_parts.append(f"Reference (ground truth) answer: {reference}")
+        if gold_doc_ids:
+            reference_parts.append(f"Ground truth document IDs: {', '.join(str(d) for d in gold_doc_ids)}")
+        if gold_chunk_ids:
+            reference_parts.append(f"Ground truth chunk IDs: {', '.join(str(c) for c in gold_chunk_ids)}")
+        reference_block = ("\n" + "\n".join(reference_parts) + "\n") if reference_parts else ""
+
+        user_content = self._prompt_template.format(
+            question=question,
+            answer=flow.answer,
+            citations=citations,
+            reference=reference_block,
+            dimension=dim,
+            rubric=DIMENSION_RUBRICS.get(dim, ""),
+        )
+        return {
+            "model": self._model,
+            "temperature": 0.0,
+            "max_tokens": self._max_tokens,
+            "messages": [
+                {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        }
+
+    # -- HTTP ----------------------------------------------------------------
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _client_kwargs(self) -> dict:
+        kwargs: dict = {"timeout": self._timeout}
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        return kwargs
+
+    async def _post_async(self, body: dict) -> httpx.Response:
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            return await client.post(
+                f"{self._base_url}/chat/completions",
+                json=body,
+                headers=self._headers(),
+            )
+
+    # -- async scoring -------------------------------------------------------
+
+    async def _score_dimension(self, flow: XyneRawFlow, dim: str, sem: asyncio.Semaphore) -> float:
+        """Score one dimension with the semaphore held; never raises.
+
+        Also records the raw judge request (input) and response (output) per
+        dimension into ``self._io`` so downstream group dumps can include the
+        LLM-judge's raw prompt+answer for diagnostics.
+        """
+        async with sem:
+            body = self._build_dimension_body(flow, dim)
+            try:
+                response = await self._post_async(body)
+                response.raise_for_status()
+                payload = response.json()
+                message = (payload["choices"][0].get("message") or {}) if payload.get("choices") else {}
+                content = message.get("content")
+                reasoning = message.get("reasoning_content")
+            except Exception:
+                return 0.0
+            value = _extract_score(content) if isinstance(content, str) else None
+            score = _quantize(value) if value is not None else 0.0
+            self._io[dim] = {
+                "dimension": dim,
+                "input": {"model": self._model, "url": f"{self._base_url}/chat/completions", "body": body},
+                "output": {
+                    "content": content if isinstance(content, str) else None,
+                    "reasoning_content": reasoning,
+                },
+                "score": score,
+            }
+            return score
+
+    async def score_async(self, flow: XyneRawFlow) -> float:
+        """Async multi-dimension judge; expose for evaluators that await it.
+
+        Returns the composite float in ``[0, 1]``. Returns ``0.0`` when no judge
+        is configured, or when every dimension is disabled.
+
+        A fresh ``asyncio.Semaphore`` is created per invocation (bound to the
+        current event loop) rather than shared across calls. Sharing one
+        semaphore across different event loops (e.g. the sync bridge's worker
+        thread vs. the caller's loop) would raise ``RuntimeError`` on a
+        contended acquire, so each invocation owns its own semaphore.
+        """
+        if not self._base_url:
+            return 0.0
+        dims = [d for d in DIMENSIONS if self._enabled_dims[d]]
+        if not dims:
+            return 0.0
+        sem = asyncio.Semaphore(self._max_concurrency)
+        dimension_scores = await asyncio.gather(
+            *(self._score_dimension(flow, d, sem) for d in dims)
+        )
+        scores = dict(zip(dims, dimension_scores))
+        return self._composite(scores)
+
+    def _composite(self, scores: dict[str, float]) -> float:
+        total_weight = 0.0
+        weighted = 0.0
+        for dim in DIMENSIONS:
+            if not self._enabled_dims[dim]:
+                continue
+            weight = self._dimension_weights.get(dim, 1.0)
+            total_weight += weight
+            weighted += weight * scores.get(dim, 0.0)
+        if total_weight == 0.0:
+            return 0.0
+        return min(1.0, max(0.0, weighted / total_weight))
+
+    def raw_io(self) -> dict:
+        """Return a deep copy of the raw per-dimension judge input/output."""
+        import copy as _copy
+        return _copy.deepcopy(dict(self._io))
+
+
+    # -- sync scoring --------------------------------------------------------
+
+    def score(self, flow: XyneRawFlow) -> float:
+        """Synchronous bridge: run the bounded async dimensions and return the composite.
+
+        Returns ``0.0`` immediately (no network) when no judge is configured.
+        Never raises; any failure resolves to ``0.0``.
+        """
+        if not self._base_url:
+            return 0.0
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is not None:
+            # Called from inside a live event loop. We cannot block the running
+            # loop, so run the bounded judge calls to completion on a fresh
+            # loop in a short-lived worker thread and return synchronously.
+            result: list[float] = []
+
+            def _run() -> None:
+                try:
+                    result.append(asyncio.run(self.score_async(flow)))
+                except Exception:
+                    result.append(0.0)
+
+            worker = threading.Thread(target=_run, daemon=True)
+            worker.start()
+            worker.join()
+            return result[0] if result else 0.0
+
+        try:
+            return asyncio.run(self.score_async(flow))
+        except Exception:
+            return 0.0
+
+
+def _render_citations(
+    citations: list[dict], *, flow: XyneRawFlow | None = None
+) -> str:
+    """Render citations with source text resolved from normalized tool evidence."""
+    if not citations:
+        if not flow or not flow.retrieved_chunks:
+            return "(none)"
+        evidence = [
+            _render_citation_line(i, item)
+            for i, item in enumerate(flow.retrieved_chunks[:20], start=1)
+        ]
+        return "(none)\nRetrieved tool evidence (not answer citations):\n" + "\n".join(evidence)
+
+    evidence_by_key = {}
+    if flow:
+        evidence_by_key = {
+            (item.get("docId"), item.get("chunk")): item
+            for item in flow.retrieved_chunks
+            if isinstance(item, dict)
+        }
+    lines = []
+    for i, citation in enumerate(citations, start=1):
+        if not isinstance(citation, dict):
+            lines.append(f"{i}. (malformed citation)")
+            continue
+        record = dict(citation)
+        key = (record.get("docId"), record.get("chunk", record.get("chunkIndex")))
+        evidence = evidence_by_key.get(key)
+        if evidence:
+            for field in ("snippet", "source_text", "title", "relevance"):
+                if field not in record and evidence.get(field) not in (None, ""):
+                    record[field] = evidence[field]
+        lines.append(_render_citation_line(i, record))
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _render_citation_line(index: int, citation: dict) -> str:
+    """Render an identifier plus source text; never emit a blank citation line."""
+    text_keys = ("source_text", "snippet", "chunk", "content", "text", "page_text")
+    snippet = ""
+    for key in text_keys:
+        value = citation.get(key)
+        if isinstance(value, str) and value.strip():
+            snippet = value.strip()
+            break
+    doc_id = citation.get("docId") or citation.get("itemId")
+    chunk = citation.get("chunk", citation.get("chunkIndex"))
+    if doc_id and chunk is not None:
+        return f"{index}. [{doc_id}#{chunk}] {snippet}".rstrip()
+    if snippet:
+        return f"{index}. {snippet}"
+    return f"{index}. [source]"
+
+
+def _first_question(request_messages: list[dict]) -> str:
+    for message in request_messages:
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""

@@ -1,0 +1,38 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*credentials*.env
+*.pem
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime output
+.runtime/
+tmp/
+logs/
+checkpoints/
+datasets/
+flow_dumps/
+wandb/
+*.log
+*.pid
+
+# Build and editor output
+build/
+dist/
+.DS_Store
+.idea/
+.vscode/
+# credentials
+polar_credentials.env
+*.env.local

@@ -1,0 +1,124 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+discovery.docker "xyne" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "30s"
+}
+
+discovery.relabel "docker_logs" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(xyne-app|xyne-ocr-autoscaler|xyne-wrapper-lighton-.*|xyne-wrapper-sim-.*|xyne-wrapper-lb|xyne-a100-lb|docling-vllm.*|docling-ocr|docling-scheduler-.*|xyne-stack-docling-scheduler-.*|xyne-app-sync|xyne-stack-app-sync.*|vespa|xyne-db|xyne-redis|xyne-prometheus|xyne-grafana|xyne-loki|xyne-alloy|cadvisor|node-exporter|postgres-exporter|redis-exporter)"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.+)"
+    target_label  = "container_name"
+  }
+
+  rule {
+    source_labels = ["container_name"]
+    regex         = "(.+)"
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "(.+)"
+    target_label  = "role"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "(docling-scheduler-.*|xyne-stack-docling-scheduler-.*)"
+    target_label  = "role"
+    replacement   = "docling-scheduler"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "(xyne-app-sync|xyne-stack-app-sync.*)"
+    target_label  = "role"
+    replacement   = "app-sync"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "xyne-app"
+    target_label  = "role"
+    replacement   = "app"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "xyne-ocr-autoscaler"
+    target_label  = "role"
+    replacement   = "ocr-autoscaler"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "(xyne-wrapper-lighton-.*|xyne-wrapper-sim-.*|xyne-wrapper-lb)"
+    target_label  = "role"
+    replacement   = "ocr-wrapper"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "(xyne-a100-lb|docling-vllm.*)"
+    target_label  = "role"
+    replacement   = "a100"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "docling-ocr"
+    target_label  = "role"
+    replacement   = "docling-ocr"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "(xyne-prometheus|xyne-grafana|xyne-loki|xyne-alloy|cadvisor|node-exporter|postgres-exporter|redis-exporter)"
+    target_label  = "role"
+    replacement   = "monitoring"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "xyne-db"
+    target_label  = "role"
+    replacement   = "postgres"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "xyne-redis"
+    target_label  = "role"
+    replacement   = "redis"
+  }
+}
+
+loki.source.docker "xyne" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.xyne.targets
+  labels        = {
+    host   = constants.hostname,
+    stream = "docker",
+  }
+  relabel_rules = discovery.relabel.docker_logs.rules
+  forward_to    = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

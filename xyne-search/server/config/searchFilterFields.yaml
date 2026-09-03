@@ -1,0 +1,269 @@
+# =============================================================================
+# searchFilterFields.yaml
+# -----------------------------------------------------------------------------
+# Single source of truth for the per-deployment "extra" fields layered onto
+# the corpus. Each entry describes ONE field across every code path that
+# touches it: the Vespa schema, the ingestion extractor, the agent's search
+# tool (via a typed operator DSL), and the UI render hints.
+#
+# WHAT'S WIRED TODAY (Phase 1):
+#   - `dataType`, `multiValued`, `filter` blocks → consumed by `vespaSearch`
+#     (tools/vespa/search.ts) via searchFilterConfig.ts to build a typed
+#     nested-operator schema the LLM passes filters through.
+#
+# WHAT'S DECLARED-BUT-NOT-YET-WIRED (future phases):
+#   - `vespa` block      → generates the matching `field foo { … }` block in
+#                          kb_items.sd at build time (Phase 2).
+#   - `ingestion` block  → drives the extractor pipeline (Phase 3).
+#   - `ui` block         → frontend render hints (Phase 4).
+#
+# ── FILTER DSL ──────────────────────────────────────────────────────────────
+# Each field declares ONE of three filter tiers:
+#
+#   tier: none    The field exists in the schema but is NOT a filter. Used for
+#                 retrieval targets (`chunks`, `chunk_embeddings`) and fields
+#                 the LLM has no business querying.
+#
+#   tier: exact   Equality-style matching. Allowed operators (subset declared
+#                 per-field in `operators:`):
+#                   eq          → `field = value`         (single exact value)
+#                   in          → `field in (…)`          (set membership)
+#                   nin         → `!(field in (…))`       (NOT in set)
+#                   contains    → `field contains "v"`    (BM25 single token)
+#                   containsAny → `(field contains a OR field contains b …)`
+#                                 (BM25 OR across multi-valued field)
+#                 NB: `contains` / `containsAny` sit in the `exact` tier
+#                 because they are equality-style (token presence), even
+#                 though the underlying match is BM25 and not strict equality.
+#
+#   tier: range   Comparison + equality. Allowed operators:
+#                   gte / gt    → `field >= v`  /  `field > v`
+#                   lte / lt    → `field <= v`  /  `field < v`
+#                   eq          → exact value (DISABLED for dataType=date —
+#                                 partial-date inputs are ambiguous; use
+#                                 gte+lte instead)
+#                   in / nin    → set membership (numerics / fixed dates)
+#
+# Allowed operator × dataType matrix (validator enforces; YAML can request
+# any subset of the allowed ops):
+#
+#                 |  eq   |  in   |  nin  |  gt/gte/lt/lte | contains | containsAny
+#   string exact  |  ✓    |  ✓    |  ✓    |       —        |    ✓     |    ✓
+#   string range  |  —    |  —    |  —    |       —        |    —     |    —    (no range on strings)
+#   number exact  |  ✓    |  ✓    |  ✓    |       —        |    —     |    —
+#   number range  |  ✓    |  ✓    |  ✓    |       ✓        |    —     |    —
+#   date   exact  |  —    |  —    |  —    |       —        |    —     |    —    (not used; dates are range-only here)
+#   date   range  |  —    |  —    |  —    |       ✓        |    —     |    —    (per design — `eq` ambiguous on partial)
+#   boolean exact |  ✓    |  —    |  —    |       —        |    —     |    —
+#
+# ── HOW THE LLM PASSES FILTERS ──────────────────────────────────────────────
+#
+# The vespaSearch tool exposes a top-level `filters` object. Each field is
+# a key; its value is a nested object of operator-keyed values:
+#
+#   {
+#     "query": "round-tripping",
+#     "filters": {
+#       "document_date":     { "gte": "2024-01-01", "lte": "2024-12-31" },
+#       "pan_ids":           { "in": ["AAACH7852C"] },
+#       "document_id":       { "eq": "WTM/AB/EFD-1/12345/2024" },
+#       "entities_involved": { "containsAny": ["HBN Dairies", "Pacheli"] },
+#       "folder":            { "contains": "Enforcements/Orders" }
+#     }
+#   }
+#
+# Field key = the YAML field's `name` (canonical, snake_case). When the
+# Vespa schema column has a different name (e.g. `pan_ids` → `pan`),
+# declare `vespaField:` at the top level — the runtime emits YQL against
+# `vespaField` but the LLM still uses the canonical name. (The `folder`
+# field is a special case: it's the field NAME the LLM uses, but the
+# clause emitted is a synthesised `clFd in (<resolved uuids>)`, not a
+# direct `vespaField` lookup — see searchCore.ts.)
+#
+# ── LOAD ORDER (see searchFilterConfig.ts) ──────────────────────────────────
+#   1. This file (default path: `<cwd>/config/searchFilterFields.yaml`;
+#      overridable via env `VESPA_SEARCH_FILTER_FIELDS_PATH`).
+#   2. `VESPA_SEARCH_FILTER_FIELDS` env (JSON array — same shape as YAML's
+#      `fields:` value, just JSON-serialised).
+#   3. Hardcoded SEBI default baked into searchFilterConfig.ts.
+# =============================================================================
+
+fields:
+  # ──────────────────────────────────────────────────────────────────────────
+  - name: document_id
+    description: >-
+      SEBI/CIR/AO/WTM-style canonical document identifier. Stored once per
+      document; never multi-valued.
+    dataType: string
+    multiValued: false
+    filter:
+      tier: exact
+      operators: [eq, in, nin]
+    vespa:
+      type: string
+      indexing: [attribute, summary]
+      attribute: [fast-search]
+      fieldsets: [search]
+    ingestion:
+      extractor: regex
+      config:
+        patterns:
+          - 'SEBI/HO/[^\s]+'
+          - 'WTM/[A-Z]+/[A-Z]+-\d+/\d+/\d{4}'
+          - 'CIR/[A-Z]+/\d{4}/\d+'
+          - 'AO/[A-Z]+/\d+/\d{4}'
+        firstMatchOnly: true
+    ui:
+      label: Document ID
+      displayInResults: true
+      copyable: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  - name: pan_ids
+    description: >-
+      PAN numbers (Indian tax identifiers, 10-char format AAAAA9999A) mentioned
+      in the document. Multi-valued attribute set; LLM filters via in/nin.
+    dataType: string
+    multiValued: true
+    filter:
+      tier: exact
+      operators: [in, nin]
+    vespa:
+      type: array<string>
+      indexing: [attribute, summary]
+      attribute: [fast-search]
+      fieldsets: [search]
+    ingestion:
+      extractor: regex
+      config:
+        pattern: '[A-Z]{5}\d{4}[A-Z]'
+        normalize: uppercase
+        dedupe: true
+    ui:
+      label: PANs
+      displayInResults: false
+
+  # ──────────────────────────────────────────────────────────────────────────
+  - name: entities_involved
+    description: >-
+      Named entities (companies / persons / regulators) the document is about.
+      LLM-extracted at ingest time; BM25-tokenised so name variants partially
+      match (e.g. "HBN Dairies" matches "HBN Dairies and Allied Limited").
+      Use containsAny — exact in/eq won't survive whitespace/punctuation drift.
+    dataType: string
+    multiValued: true
+    filter:
+      tier: exact
+      operators: [containsAny]
+    vespa:
+      type: array<string>
+      indexing: [index, summary]
+      index: { enable-bm25: true }
+      fieldsets: [search]
+    ingestion:
+      extractor: llm
+      config:
+        promptId: "extract-entities-v3"
+        model: sonnet
+        maxEntitiesPerDoc: 40
+    ui:
+      label: Entities
+      displayInResults: true
+      maxRenderedInCard: 4
+
+  # ──────────────────────────────────────────────────────────────────────────
+  - name: referenced_ids
+    description: >-
+      Document IDs (SEBI/CIR/AO/WTM) THIS document cites. Lets users follow
+      the citation graph forward and answers "which orders reference circular
+      X" questions. Multi-valued, BM25-tokenised — use containsAny.
+    dataType: string
+    multiValued: true
+    filter:
+      tier: exact
+      operators: [containsAny]
+    vespa:
+      type: array<string>
+      indexing: [index, summary]
+      index: { enable-bm25: true }
+      fieldsets: [search]
+    ingestion:
+      extractor: regex
+      config:
+        patterns:
+          - 'SEBI/HO/[^\s]+'
+          - 'WTM/[A-Z]+/[A-Z]+-\d+/\d+/\d{4}'
+          - 'CIR/[A-Z]+/\d{4}/\d+'
+          - 'AO/[A-Z]+/\d+/\d{4}'
+        firstMatchOnly: false
+        dedupe: true
+    ui:
+      label: References
+      displayInResults: false
+
+  # ──────────────────────────────────────────────────────────────────────────
+  - name: document_date
+    description: >-
+      Effective date of the document, encoded as YYYYMMDD int so Vespa's
+      numeric range ops work directly. Range-only — `eq` is excluded
+      because partial-date inputs ("2024" vs "2024-06-15") would be
+      ambiguous; for a single-day filter, pass {gte:"2024-06-15", lte:"2024-06-15"}.
+    dataType: date
+    multiValued: false
+    filter:
+      tier: range
+      operators: [gte, lte, gt, lt]
+      encoding: yyyymmddInt
+    vespa:
+      type: long
+      indexing: [attribute, summary]
+      attribute: [fast-search]
+    ingestion:
+      extractor: header
+      config:
+        sources: [filename_prefix, frontmatter_date, body_first_date]
+        outputFormat: yyyymmddInt
+    ui:
+      label: Date
+      displayInResults: true
+      format: "YYYY-MM-DD"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Removed 2026-05-29: `file_name` was exposed with `contains` for folder
+  # scoping, but `fileName contains "<path>"` cannot be pushed into Vespa's
+  # HNSW pre-filter (phrase match on an indexed string is not attribute
+  # fast-search). Combined with `query` + alpha>0 it silently collapsed
+  # recall to ~1% of large folders. Replaced by the `folder` field below,
+  # which resolves the path to a list of `clFd` UUIDs and emits
+  # `clFd in (...)` — a fast-search attribute that HNSW pre-filters
+  # cleanly. See project memory `vespasearch_folder_filter_bug` for the
+  # measurements that drove this removal. The underlying Vespa `fileName`
+  # field still exists in `kb_items.sd` (used for display + BM25 ranking
+  # signal in `lexical_score`); we just don't expose it as a filter input.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  - name: folder
+    description: >-
+      Folder-scoped search. Pass a path from `getFolderTree`
+      (e.g. "Legal/Circulars" or "Enforcements/Orders/Orders of AO") via
+      `contains`, or several paths via `containsAny`. The tool looks the
+      path up in `collection_items`, recursively expands every sub-folder
+      beneath it, and emits `clFd in (<uuids>)` so Vespa's HNSW pre-filter
+      catches the whole subtree. This is the only supported way to scope by
+      folder — the previous `file_name.contains "<path>"` route was removed
+      (see the removal note above the previous entry for why).
+    dataType: string
+    multiValued: false
+    vespaField: clFd
+    filter:
+      tier: exact
+      operators: [contains, containsAny]
+    vespa:
+      schemaFieldName: clFd
+      type: string
+      indexing: [attribute, summary]
+      attribute: [fast-search]
+    ui:
+      label: Folder
+      displayInResults: false
+      treeView: true

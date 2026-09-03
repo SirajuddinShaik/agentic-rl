@@ -1,0 +1,2117 @@
+{
+  "uid": "xyne-ocr-observability",
+  "title": "Xyne OCR Observability",
+  "tags": [
+    "xyne",
+    "ocr",
+    "vm"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Autoscaler Freshness",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Autoscaler Snapshot",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_autoscaler_snapshot_ready",
+          "legendFormat": "snapshot"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "unusable",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "usable",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Snapshot Age",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - xyne_ocr_autoscaler_last_success_timestamp_seconds",
+          "legendFormat": "seconds"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 90
+              },
+              {
+                "color": "red",
+                "value": 180
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Fleet Discovery Error",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(xyne_ocr_fleet_discovery_error)",
+          "legendFormat": "errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ok",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "error",
+                  "color": "red"
+                },
+                "2": {
+                  "text": "errors",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Autoscaler Scrape",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"ocr-autoscaler\"}",
+          "legendFormat": "up"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "down",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "up",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "OCR Cost",
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Current OCR Cost / Hour",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_estimated_cost_per_hour",
+          "legendFormat": "{{currency}}/hour"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Estimated OCR Cost In Selected Range",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg_over_time(xyne_ocr_estimated_cost_per_hour[$__range]) * $__range_s / 3600",
+          "legendFormat": "{{currency}} selected range"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Fleet Cost / Hour",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_fleet_cost_per_hour",
+          "legendFormat": "{{fleet}} {{currency}}/hour"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "OCR Direct Scrape Coverage",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Fleet Targets: Discovered vs Healthy",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_fleet_discovered_targets",
+          "legendFormat": "discovered {{fleet}}"
+        },
+        {
+          "refId": "B",
+          "expr": "label_replace(xyne_ocr_wrapper_nodes{state=\"app_healthy\"},\"fleet\",\"wrapper\",\"state\",\".*\") or label_replace(xyne_ocr_a100_nodes{state=\"healthy\"},\"fleet\",\"a100\",\"state\",\".*\")",
+          "legendFormat": "healthy {{fleet}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "minVizWidth": 8,
+        "minVizHeight": 10,
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCR Backend Scrape Targets",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\"}",
+          "legendFormat": "scrape {{instance}}"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_mock_vllm_bbox_up{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\"}",
+          "legendFormat": "mock bbox {{node_id}} {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Expected OCR-BBox Fleet Size",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_fleet_discovered_targets{fleet=\"a100\"}",
+          "legendFormat": "discovered OCR-BBox targets"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(up{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\"})",
+          "legendFormat": "scraped OCR-BBox targets up"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "minVizWidth": 8,
+        "minVizHeight": 10,
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Stale Local OCR Targets",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(up{job=\"ocr-vllm-direct\",instance=~\"host\\\\.docker\\\\.internal:(8000|8002)\"}) or vector(0)",
+          "legendFormat": "old local targets up"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Autoscaler Decision Path",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Demand Pages",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_pending_pages",
+          "legendFormat": "pending"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_active_pages",
+          "legendFormat": "active"
+        },
+        {
+          "refId": "C",
+          "expr": "xyne_ocr_pending_pages + xyne_ocr_active_pages",
+          "legendFormat": "total demand"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Admitted Pages: Raw vs Effective",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_decision_raw_admitted_pages",
+          "legendFormat": "raw decision"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_decision_effective_admitted_pages",
+          "legendFormat": "effective decision"
+        },
+        {
+          "refId": "C",
+          "expr": "xyne_ocr_runtime_admitted_page_budget",
+          "legendFormat": "runtime budget"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Submit Permits: Raw vs Effective",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_decision_raw_submit_permits",
+          "legendFormat": "raw decision"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_decision_effective_submit_permits",
+          "legendFormat": "effective decision"
+        },
+        {
+          "refId": "C",
+          "expr": "xyne_ocr_runtime_submit_permits",
+          "legendFormat": "runtime permits"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Fleet Scaling",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Wrapper Nodes: Current vs Desired",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"current\"}",
+          "legendFormat": "current"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_decision_desired_wrapper_nodes",
+          "legendFormat": "desired"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCR-BBox / A100 Nodes: Current vs Desired",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_a100_nodes{state=\"current\"}",
+          "legendFormat": "current"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_decision_desired_a100_nodes",
+          "legendFormat": "desired"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Submitter Containers: Current vs Desired",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_submitter_containers{state=\"current\"}",
+          "legendFormat": "current"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_decision_desired_submitter_containers",
+          "legendFormat": "desired"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "OCR-BBox / vLLM Runtime",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCR-BBox Running Requests",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 49
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(instance, node_id, model_name) (vllm:num_requests_running{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"})",
+          "legendFormat": "{{node_id}} {{instance}} {{model_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCR-BBox Queue Pressure",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 49
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(instance, node_id, model_name) (vllm:num_requests_waiting{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"})",
+          "legendFormat": "waiting {{node_id}} {{instance}} {{model_name}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by(instance, node_id, model_name) (vllm:num_requests_waiting_by_reason{job=\"ocr-vllm-direct\",reason=\"capacity\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"})",
+          "legendFormat": "capacity waiting {{node_id}} {{instance}} {{model_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCR-BBox KV/GPU Cache",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 49
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * avg by(instance, node_id, model_name) (vllm:kv_cache_usage_perc{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"} or vllm:gpu_cache_usage_perc{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"})",
+          "legendFormat": "{{node_id}} {{instance}} {{model_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCR-BBox p95 Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 49
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by(le, instance, node_id, model_name) (rate(vllm:request_queue_time_seconds_bucket{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"}[5m])))",
+          "legendFormat": "queue {{node_id}} {{instance}} {{model_name}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by(le, instance, node_id, model_name) (rate(vllm:e2e_request_latency_seconds_bucket{job=\"ocr-vllm-direct\",instance!~\"host\\\\.docker\\\\.internal:(8000|8002)\",model_name=~\".*bbox.*|.*BBox.*|.*BBOX.*\"}[5m])))",
+          "legendFormat": "e2e {{node_id}} {{instance}} {{model_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Wrapper Fleet Runtime",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 57
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Wrapper Fleet Health",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"current\"}",
+          "legendFormat": "current wrappers"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"backend_healthy\"}",
+          "legendFormat": "backend healthy wrappers"
+        },
+        {
+          "refId": "C",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"app_healthy\"}",
+          "legendFormat": "app healthy wrappers"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Wrapper Health Diagnostics",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"backend_healthy\"}",
+          "legendFormat": "backend healthy"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"app_healthy\"}",
+          "legendFormat": "app healthy"
+        },
+        {
+          "refId": "C",
+          "expr": "xyne_ocr_wrapper_nodes{state=\"current\"}",
+          "legendFormat": "current"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Pipeline Backlog",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Missing/Invalid Part Page Counts",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 67
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_docling_parts_missing_page_count_total",
+          "legendFormat": "missing/invalid"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Files Not Terminal",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 67
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(xyne_docling_files_total{status=~\"pending_split|splitting|queued_for_ocr|ocr_active|ready_to_write|writing\"}) or vector(0)",
+          "legendFormat": "files"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Parts Not Written",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 67
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(xyne_docling_parts_total{status=~\"queued|submitting|submitted|ready\"}) or vector(0)",
+          "legendFormat": "parts"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Completed Pages/min",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 67
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_completed_pages_per_minute",
+          "legendFormat": "pages/min"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "DB Status Snapshots",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 72
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "Files by Status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 73
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_docling_files_total",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "File Pages by Status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 73
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_docling_file_pages_total",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "Parts by Status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 73
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_docling_parts_total",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "Part Pages by Status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 73
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_docling_part_pages_total",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Runtime Config",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Runtime Values",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 82
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_runtime_admitted_page_budget",
+          "legendFormat": "admitted pages"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_runtime_submit_permits",
+          "legendFormat": "submit permits"
+        },
+        {
+          "refId": "C",
+          "expr": "xyne_ocr_runtime_vespa_write_permits",
+          "legendFormat": "vespa permits"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Config Age",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 82
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_runtime_config_age_seconds",
+          "legendFormat": "seconds"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Autoscaler-Written Config",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 82
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_runtime_config_autoscaler_written",
+          "legendFormat": "written by autoscaler"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Redis Control Plane",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scheduler Permits",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 89
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_redis_permits_active",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Result Stream",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 89
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_results_stream_length",
+          "legendFormat": "stream length"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_results_stream_pending",
+          "legendFormat": "pending {{group}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis Health",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 89
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "redis_up",
+          "legendFormat": "up"
+        },
+        {
+          "refId": "B",
+          "expr": "redis_connected_clients",
+          "legendFormat": "clients"
+        },
+        {
+          "refId": "C",
+          "expr": "redis_memory_used_bytes",
+          "legendFormat": "memory"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Vespa / Writer",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 97
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Vespa Permits",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 98
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "xyne_ocr_runtime_vespa_write_permits",
+          "legendFormat": "runtime"
+        },
+        {
+          "refId": "B",
+          "expr": "xyne_ocr_redis_permits_active{kind=\"vespa-write\"}",
+          "legendFormat": "active"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Vespa Feed Rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 98
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "feed_operations_rate",
+          "legendFormat": "feed ops"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Vespa Feed Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 16,
+        "y": 98
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(feed_latency_sum[5m]) / rate(feed_latency_count[5m])",
+          "legendFormat": "latency"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Vespa Feeding Blocked",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 20,
+        "y": 98
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(content_proton_resource_usage_feeding_blocked_last)",
+          "legendFormat": "blocked"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Infrastructure Diagnostics",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 106
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Host CPU and Memory",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 107
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "legendFormat": "cpu used"
+        },
+        {
+          "refId": "B",
+          "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+          "legendFormat": "memory used"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Host Disk",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 107
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(1 - (node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|overlay\"})) * 100",
+          "legendFormat": "disk used"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Postgres Health",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 107
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "pg_up",
+          "legendFormat": "up"
+        },
+        {
+          "refId": "B",
+          "expr": "pg_stat_activity_count",
+          "legendFormat": "connections"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Diagnostic Logs",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 115
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Autoscaler Errors",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 116
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{role=\"ocr-autoscaler\"} |~ \"(?i)(error|failed|timeout|lock)\""
+        }
+      ],
+      "options": {
+        "showLabels": false,
+        "showTime": true,
+        "wrapLogMessage": true
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Scheduler Role Failures",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 116
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{role=\"docling-scheduler\"} |~ \"(?i)(error|failed|timeout|retry)\""
+        }
+      ],
+      "options": {
+        "showLabels": false,
+        "showTime": true,
+        "wrapLogMessage": true
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Vespa Write Failures and Timeouts",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 124
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service=~\"vespa|xyne-app-sync|xyne-stack-app-sync.*\"} |~ \"(?i)(vespa|feed|write).*(error|failed|timeout)|timeout\""
+        }
+      ],
+      "options": {
+        "showLabels": false,
+        "showTime": true,
+        "wrapLogMessage": true
+      }
+    },
+    {
+      "type": "logs",
+      "title": "OCR Submit Rejects and Runtime Updates",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 124
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{role=~\"app-sync|docling-scheduler|ocr-autoscaler\"} |~ \"(?i)(429|reject|rate limit|runtime config|Updated Docling runtime config)\""
+        }
+      ],
+      "options": {
+        "showLabels": false,
+        "showTime": true,
+        "wrapLogMessage": true
+      }
+    }
+  ]
+}

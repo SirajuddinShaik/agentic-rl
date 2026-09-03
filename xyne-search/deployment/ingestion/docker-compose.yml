@@ -1,0 +1,444 @@
+name: xyne-stack
+
+x-ingestion-env: &ingestion-env
+  NODE_ENV: production
+  DATABASE_HOST: xyne-db
+  DATABASE_PORT: "5432"
+  DATABASE_USER: xyne
+  DATABASE_PASSWORD: xyne
+  DATABASE_URL: postgresql://xyne:xyne@xyne-db:5432/xyne?sslmode=disable
+  POSTGRES_PASSWORD: xyne
+  VESPA_HOST: vespa
+  VESPA_FEED_PORT: "8080"
+  VESPA_QUERY_PORT: "8081"
+  VESPA_REQUIRED: "false"
+  MAIN_SERVER_HOST: app
+  HOST: https://demo.xyne.juspay.io
+  REDIS_URL: redis://redis:6379/0
+  DOCLING_ENABLED: "true"
+  DOCLING_SERVICE_URL: http://10.2.0.83
+  DOCLING_TIMEOUT_MS: "900000"
+  DOCLING_PAGE_CHUNK_SIZE: "25"
+  DOCLING_STREAMING_MIN_PAGES: "101"
+  DOCLING_ASYNC_ENABLED: "true"
+  DOCLING_ASYNC_SCHEDULER_ENABLED: "true"
+  DOCLING_RESULTS_STREAM: docling:results
+  DOCLING_SCHEDULER_RESULT_GROUP: app-sync-scheduler
+  DOCLING_RUNTIME_CONFIG_KEY: docling:runtime-config
+  DOCLING_RUNTIME_CONFIG_POLL_MS: "30000"
+  DOCLING_RESULT_CONCURRENCY: "1"
+  DOCLING_RESULT_READ_COUNT: "50"
+  DOCLING_RESULT_MIN_IDLE_MS: "60000"
+  DOCLING_ASYNC_SUBMIT_PERMITS_ENABLED: "true"
+  DOCLING_ASYNC_SUBMIT_PERMITS: "240"
+  DOCLING_ASYNC_SUBMIT_PERMIT_LEASE_TTL_MS: "21600000"
+  DOCLING_SCHEDULER_SUBMITTED_TIMEOUT_MS: "1800000"
+  DOCLING_SCHEDULER_POLL_MS: "1000"
+  DOCLING_SCHEDULER_ADMISSION_POLL_MS: "1000"
+  DOCLING_SCHEDULER_SUBMIT_CLAIM_BATCH_SIZE: "32"
+  DOCLING_SCHEDULER_MAX_CONCURRENT_CLAIMERS: "1"
+  DOCLING_SCHEDULER_SUBMIT_PREFETCH_MULTIPLIER: "0"
+  DOCLING_SCHEDULER_SLOW_ADMIT_MS: "500"
+  DOCLING_SCHEDULER_SLOW_CLAIM_MS: "500"
+  DOCLING_SCHEDULER_SLOW_READ_PART_MS: "1000"
+  DOCLING_SCHEDULER_SLOW_SUBMIT_MS: "5000"
+  DOCLING_SCHEDULER_SUBMITTER_SHUTDOWN_DRAIN_MS: "180000"
+  DOCLING_SCHEDULER_LEASE_MS: "900000"
+  DOCLING_SCHEDULER_SPLIT_CONCURRENCY: "8"
+  DOCLING_SCHEDULER_MAX_INFLIGHT_PAGES: "24000"
+  DOCLING_SCHEDULER_TARGET_ACTIVE_OCR_FILES: "60"
+  DOCLING_SCHEDULER_PER_FILE_INFLIGHT_PAGES: "400"
+  DOCLING_SCHEDULER_PER_FILE_BURST_PAGES: "24000"
+  DOCLING_SCHEDULER_MAX_PART_ATTEMPTS: "3"
+  DOCLING_SCHEDULER_MAX_SPLIT_ATTEMPTS: "3"
+  DOCLING_SCHEDULER_MAX_WRITE_ATTEMPTS: "20"
+  DOCLING_SCHEDULER_RETRY_BASE_MS: "30000"
+  DOCLING_SCHEDULER_RETRY_MAX_MS: "1800000"
+  DOCLING_SCHEDULER_VESPA_WRITE_PERMITS: "8"
+  DOCLING_SCHEDULER_VESPA_WRITE_PERMIT_TTL_MS: "960000"
+  DOCLING_SCHEDULER_VESPA_WRITE_TIMEOUT_MS: "660000"
+  VESPA_DOCUMENT_UPDATE_TIMEOUT: "600s"
+  DOCLING_SCHEDULER_MAX_VESPA_PAYLOAD_BYTES: "9437184"
+  KB_STORAGE_ROOT: storage/kb_files
+  DOCLING_ASYNC_STORAGE_ROOT: storage/doclingAsync
+  APP_SYNC_PDF_LIB_CONCURRENCY: "8"
+  APP_SYNC_PDF_LIB_SEMAPHORE_TIMEOUT_MS: "600000"
+  APP_SYNC_PDF_LIB_ACTIVE_TIMEOUT_MS: "300000"
+  QPDF_TIMEOUT_MS: "300000"
+  DB_POOL_MAX: "5"
+  DB_POOL_IDLE_TIMEOUT: "30"
+  LITELLM_MODEL_CONFIG_PATH: /usr/src/app/server/litellm-models.json
+
+x-ingestion-worker: &ingestion-worker
+  image: ${INGESTION_IMAGE:?set INGESTION_IMAGE}
+  user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    <<: *ingestion-env
+  volumes:
+    - ${XYNE_DATA_DIR:-./data}/app-uploads:/usr/src/app/server/storage
+    - ${XYNE_DATA_DIR:-./data}/app-logs:/usr/src/app/server/logs
+    - ${XYNE_DATA_DIR:-./data}/app-downloads:/usr/src/app/server/downloads
+    - ./litellm-models.json:/usr/src/app/server/litellm-models.json:ro
+  networks:
+    - xyne
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  command: ["bun", "doclingSchedulerWorker.ts"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "6"
+
+x-submitter: &submitter
+  <<: *ingestion-worker
+  stop_grace_period: 200s
+  environment:
+    <<: *ingestion-env
+    DOCLING_SCHEDULER_ROLE: submitter
+
+x-result-worker: &result-worker
+  <<: *ingestion-worker
+  environment:
+    <<: *ingestion-env
+    DOCLING_SCHEDULER_ROLE: result
+
+services:
+  app-sync:
+    <<: *ingestion-worker
+    profiles: ["app-sync"]
+    container_name: xyne-app-sync
+    ports:
+      - "3010:3010"
+    environment:
+      <<: *ingestion-env
+      DOCLING_ASYNC_SCHEDULER_ENABLED: "true"
+      DOCLING_RUNTIME_CONFIG_KEY: docling:runtime-config
+      DOCLING_RUNTIME_CONFIG_POLL_MS: "30000"
+      DOCLING_PAGE_CHUNK_SIZE: "200"
+      DOCLING_RESULT_GROUP: app-sync
+      DOCLING_ACTIVE_FILE_LIMIT: "160"
+      DOCLING_ASYNC_SUBMIT_PERMIT_POLL_MS: "10000"
+      DOCLING_ASYNC_PART_SUBMIT_CONCURRENCY: "1"
+      DOCLING_ASYNC_SUBMIT_RETRIES: "30"
+      DOCLING_ASYNC_SUBMIT_RETRY_DELAY_MS: "2000"
+      PDF_FILE_PROCESSING_WORKER_THREADS: "4"
+      PDF_FILE_PROCESSING_TEAM_SIZE: "1"
+      FILE_PROCESSING_WORKER_THREADS: "1"
+      FILE_PROCESSING_TEAM_SIZE: "1"
+      APP_SYNC_PDF_LIB_CONCURRENCY: "4"
+      DB_POOL_MAX: "20"
+      PGBOSS_POOL_MAX: "20"
+      DB_APPLICATION_NAME: xyne-drizzle-sync
+      PGBOSS_APPLICATION_NAME: xyne-pgboss-sync
+      PDF_PROCESSING_DISABLE_FALLBACKS: "true"
+      DISABLE_INTEGRATION_SYNC_WORKERS: "false"
+      DISABLE_APP_SYNC_PROCESSING_WORKERS: "false"
+      APP_SYNC_HEALTH_CURL_TIMEOUT_SECONDS: "10"
+      APP_SYNC_HEALTH_START_GRACE_SECONDS: "180"
+      APP_SYNC_HEALTH_MAX_FAILURES: "3"
+      APP_SYNC_DIAGNOSTICS_ENABLED: "true"
+      APP_SYNC_DIAGNOSTICS_DIR: /usr/src/app/server/logs/app-sync-diagnostics
+      APP_SYNC_RESOURCE_SAMPLE_INTERVAL_MS: "2000"
+      VESPA_MAX_RETRY_ATTEMPTS: "4"
+      VESPA_RETRY_DELAY_MS: "4000"
+    volumes:
+      - ${XYNE_DATA_DIR:-./data}/app-uploads:/usr/src/app/server/storage
+      - ${XYNE_DATA_DIR:-./data}/app-logs:/usr/src/app/server/logs
+      - ${XYNE_DATA_DIR:-./data}/app-assets:/usr/src/app/server/dist/assets/videos
+      - ${XYNE_DATA_DIR:-./data}/app-migrations:/usr/src/app/server/migrations
+      - ${XYNE_DATA_DIR:-./data}/app-downloads:/usr/src/app/server/downloads
+      - ./litellm-models.json:/usr/src/app/server/litellm-models.json:ro
+    command: ["bun", "run", "sync-server.ts"]
+    healthcheck:
+      test: ["CMD", "sh", "/usr/src/app/server/scripts/app-sync-healthcheck.sh"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 180s
+
+  app-sync-result-worker:
+    <<: *ingestion-worker
+    container_name: xyne-stack-app-sync-result-worker-1
+    environment:
+      <<: *ingestion-env
+      DOCLING_ASYNC_SCHEDULER_ENABLED: "false"
+      DOCLING_RESULT_GROUP: app-sync
+      DOCLING_ACTIVE_FILE_LIMIT: "160"
+      DOCLING_ASYNC_SUBMIT_PERMIT_POLL_MS: "10000"
+      DOCLING_RESULT_CONCURRENCY: "1"
+      DOCLING_RESULT_READ_COUNT: "1"
+      DB_APPLICATION_NAME: xyne-drizzle-docling-results
+      DB_POOL_MAX: "10"
+      APP_SYNC_DIAGNOSTICS_ENABLED: "true"
+      APP_SYNC_DIAGNOSTICS_DIR: /usr/src/app/server/logs/app-sync-diagnostics
+    command: ["bun", "run", "doclingResultWorker.ts"]
+
+  docling-scheduler-splitter:
+    <<: *ingestion-worker
+    container_name: docling-scheduler-splitter
+    environment:
+      <<: *ingestion-env
+      DOCLING_SCHEDULER_ROLE: splitter
+
+  docling-scheduler-submitter:
+    <<: *submitter
+    container_name: docling-scheduler-submitter
+
+  docling-scheduler-submitter-2:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-2
+
+  docling-scheduler-submitter-3:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-3
+
+  docling-scheduler-submitter-4:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-4
+
+  docling-scheduler-submitter-5:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-5
+
+  docling-scheduler-submitter-6:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-6
+
+  docling-scheduler-submitter-7:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-7
+
+  docling-scheduler-submitter-8:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-8
+
+  docling-scheduler-submitter-9:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-9
+
+  docling-scheduler-submitter-10:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-10
+
+  docling-scheduler-submitter-11:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-11
+
+  docling-scheduler-submitter-12:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-12
+
+  docling-scheduler-submitter-13:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-13
+
+  docling-scheduler-submitter-14:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-14
+
+  docling-scheduler-submitter-15:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-15
+
+  docling-scheduler-submitter-16:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-16
+
+  docling-scheduler-submitter-17:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-17
+
+  docling-scheduler-submitter-18:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-18
+
+  docling-scheduler-submitter-19:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-19
+
+  docling-scheduler-submitter-20:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-20
+
+  docling-scheduler-submitter-21:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-21
+
+  docling-scheduler-submitter-22:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-22
+
+  docling-scheduler-submitter-23:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-23
+
+  docling-scheduler-submitter-24:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-24
+
+  docling-scheduler-submitter-25:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-25
+
+  docling-scheduler-submitter-26:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-26
+
+  docling-scheduler-submitter-27:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-27
+
+  docling-scheduler-submitter-28:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-28
+
+  docling-scheduler-submitter-29:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-29
+
+  docling-scheduler-submitter-30:
+    <<: *submitter
+    profiles: ["submitter-spares"]
+    container_name: docling-scheduler-submitter-30
+
+  docling-scheduler-result:
+    <<: *result-worker
+    container_name: docling-scheduler-result
+
+  docling-scheduler-result-2:
+    <<: *result-worker
+    container_name: docling-scheduler-result-2
+
+  docling-scheduler-result-3:
+    <<: *result-worker
+    container_name: docling-scheduler-result-3
+
+  docling-scheduler-result-4:
+    <<: *result-worker
+    container_name: docling-scheduler-result-4
+
+  docling-scheduler-writer:
+    <<: *ingestion-worker
+    container_name: docling-scheduler-writer
+    environment:
+      <<: *ingestion-env
+      DOCLING_SCHEDULER_ROLE: writer
+
+  docling-scheduler-reaper:
+    <<: *ingestion-worker
+    container_name: docling-scheduler-reaper
+    environment:
+      <<: *ingestion-env
+      DOCLING_SCHEDULER_ROLE: reaper
+
+  ocr-autoscaler:
+    image: ${INGESTION_IMAGE:?set INGESTION_IMAGE}
+    container_name: xyne-ocr-autoscaler
+    user: bun
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      DATABASE_HOST: xyne-db
+      DATABASE_PORT: "5432"
+      DATABASE_USER: xyne
+      DATABASE_PASSWORD: xyne
+      DATABASE_URL: postgresql://xyne:xyne@xyne-db:5432/xyne?sslmode=disable
+      VESPA_HOST: vespa
+      REDIS_URL: redis://xyne-redis:6379/0
+      GCP_PROJECT: xyne-spaces-sbx
+      GOOGLE_CLOUD_PROJECT: xyne-spaces-sbx
+      GCP_ZONE: asia-southeast1-a
+      OCR_AUTOSCALER_DRY_RUN: "false"
+      OCR_AUTOSCALER_ONCE: "false"
+      OCR_AUTOSCALER_INTERVAL_MS: "30000"
+      OCR_AUTOSCALER_GCP_ACTUATOR: metadata
+      OCR_AUTOSCALER_RESIZE_MIGS: "true"
+      OCR_AUTOSCALER_WRITE_RUNTIME_CONFIG: "true"
+      OCR_AUTOSCALER_METRICS_ENABLED: "true"
+      OCR_AUTOSCALER_METRICS_PORT: "3021"
+      OCR_AUTOSCALER_A100_DISCOVERY: mig
+      OCR_AUTOSCALER_A100_MIG: lightonocr-fleet-mig
+      OCR_AUTOSCALER_A100_MIN_NODES: "1"
+      OCR_AUTOSCALER_A100_MAX_NODES: "62"
+      OCR_AUTOSCALER_A100_CAPACITY_WAITING_SUSTAIN_MS: "180000"
+      OCR_AUTOSCALER_WRAPPER_MIG: lighton-ocr-wrapper-fleet-mig
+      OCR_AUTOSCALER_WRAPPER_MIN_NODES: "1"
+      OCR_AUTOSCALER_WRAPPER_MAX_NODES: "16"
+      OCR_AUTOSCALER_WRAPPER_BACKEND_SERVICE: lighton-ocr-wrapper-fleet-backend
+      OCR_AUTOSCALER_WRAPPER_BACKEND_SERVICE_REGION: asia-southeast1
+      OCR_AUTOSCALER_WRAPPER_HEALTH_PATH: /health
+      OCR_AUTOSCALER_WRAPPER_HEALTH_TIMEOUT_MS: "15000"
+      OCR_AUTOSCALER_WRAPPER_HEALTH_FAILURE_THRESHOLD: "5"
+      OCR_AUTOSCALER_WRAPPER_ASYNC_MAX_INFLIGHT: "125"
+      OCR_AUTOSCALER_WRAPPER_LIGHTON_CONCURRENCY: "250"
+      OCR_AUTOSCALER_SUBMIT_PERMITS_PER_WRAPPER: "440"
+      OCR_AUTOSCALER_ACTIVE_OCR_FILE_LIMIT: "10000"
+      OCR_AUTOSCALER_SUBMITTER_CONTAINER_COUNT: "6"
+      OCR_AUTOSCALER_SUBMITTER_COUNT_COMMAND: /usr/local/bin/count-docling-submitters.sh
+      OCR_AUTOSCALER_SUBMITTER_SCALE_COMMAND: /usr/local/bin/scale-docling-submitters.sh {count}
+      OCR_AUTOSCALER_SUBMITTER_FIXED_CONCURRENCY: "80"
+      OCR_AUTOSCALER_SUBMITTER_PAGE_CHUNK_SIZE: "1"
+      OCR_AUTOSCALER_SUBMITTER_PAGES_PER_SECOND_PER_CONTAINER: "120"
+      OCR_AUTOSCALER_SUBMITTER_TARGET_FILL_SECONDS: "60"
+      OCR_AUTOSCALER_PERMIT_FILL_TARGET: "0.85"
+      OCR_AUTOSCALER_PERMIT_FILL_DOWNSCALE_TARGET: "0.95"
+      SUBMITTER_CONTAINER_MIN: "1"
+      OCR_COST_CONFIG_PATH: /etc/xyne/ocr-costs.json
+    group_add:
+      - "${DOCKER_SOCKET_GID:-999}"
+    ports:
+      - "3021:3021"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${OCR_COST_FILE:-/opt/monitoring/ocr-costs.json}:/etc/xyne/ocr-costs.json:ro
+      - ${INGESTION_HELPER_DIR:-./deployment/ingestion/bin}/count-docling-submitters.sh:/usr/local/bin/count-docling-submitters.sh:ro
+      - ${INGESTION_HELPER_DIR:-./deployment/ingestion/bin}/scale-docling-submitters.sh:/usr/local/bin/scale-docling-submitters.sh:ro
+    networks:
+      - xyne
+    restart: unless-stopped
+    command: ["bun", "run", "scripts/ocrAutoscaler.ts"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+networks:
+  xyne:
+    external: true
+    name: ${XYNE_DOCKER_NETWORK:-xyne-stack_xyne}

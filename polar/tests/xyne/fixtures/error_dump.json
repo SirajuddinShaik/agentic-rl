@@ -1,0 +1,20 @@
+{
+  "conversation_id": "conv_63227455-c170-48ba-854f-ea8c3f487840",
+  "run_id": "",
+  "request_messages": [
+    {
+      "role": "user",
+      "content": "In SEBI Spl Case No.259/14, approximately how much of the amount collected from investors remained unrefunded according to the figures placed before the court?"
+    }
+  ],
+  "answer": "",
+  "citations": [],
+  "debug_events": [],
+  "nested_runs": [],
+  "error": "send message failed (status=400): {\"error\": \"Model glm-flash-experimental is not allowed\"}",
+  "latency_ms": 1.8826610030373558,
+  "wall_clock_ms": 19.816072002868168,
+  "metadata": {
+    "requested_model": "glm-flash-experimental"
+  }
+}

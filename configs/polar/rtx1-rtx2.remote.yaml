@@ -1,0 +1,20 @@
+rollout:
+  host: 127.0.0.1
+  port: 8080
+  public_url: http://127.0.0.1:8080
+  save_dir: /data/siraj/logs/xyne_grpo/rollouts
+
+gateway:
+  heartbeat_interval_seconds: 5
+  nodes:
+    - id: xyne-node
+      host: 127.0.0.1
+      port: 8100
+      public_url: http://127.0.0.1:8100
+      max_init_workers: 4
+      max_run_workers: 128
+      max_postrun_workers: 32
+      model_served: nemotron-30b-a3b
+      inference:
+        engine: sglang
+        base_url: http://192.168.111.7:30100

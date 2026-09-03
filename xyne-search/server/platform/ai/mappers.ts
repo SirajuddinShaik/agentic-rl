@@ -1,0 +1,537 @@
+import { AIProviders, Models, type Cost } from "@/platform/ai/types"
+import { getModelConfiguration } from "./modelConfig"
+
+const getActualModelName = (model: Models): string => {
+  return getModelConfiguration(model)?.actualName || model
+}
+export const modelDetailsMap: Record<
+  string,
+  { name: string; cost: { onDemand: Cost; batch?: Cost } }
+> = {
+  [Models.Llama_3_2_1B]: {
+    name: "Llama 3.2 Instruct (1B)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0001,
+        pricePerThousandOutputTokens: 0.0001,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.00005,
+        pricePerThousandOutputTokens: 0.00005,
+      },
+    },
+  },
+  [Models.Llama_3_2_3B]: {
+    name: "Llama 3.2 Instruct (3B)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00015,
+        pricePerThousandOutputTokens: 0.00015,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.000075,
+        pricePerThousandOutputTokens: 0.000075,
+      },
+    },
+  },
+  [Models.Llama_3_1_8B]: {
+    name: "Llama 3.1 Instruct (8B)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00022,
+        pricePerThousandOutputTokens: 0.00022,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.00011,
+        pricePerThousandOutputTokens: 0.00011,
+      },
+    },
+  },
+  [Models.Llama_3_1_70B]: {
+    name: "Llama 3.1 Instruct (70B)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00099,
+        pricePerThousandOutputTokens: 0.00099,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.0005,
+        pricePerThousandOutputTokens: 0.0005,
+      },
+    },
+  },
+  [Models.Llama_3_1_405B]: {
+    name: "Llama 3.1 Instruct (405B)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00532,
+        pricePerThousandOutputTokens: 0.016,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.00266,
+        pricePerThousandOutputTokens: 0.008,
+      },
+    },
+  },
+  [Models.Gpt_4o]: {
+    name: "GPT-4o",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0025,
+        pricePerThousandOutputTokens: 0.01,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.00125,
+        pricePerThousandOutputTokens: 0.005,
+      },
+    },
+  },
+  [Models.Gpt_4o_mini]: {
+    name: "GPT-4o Mini",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00015,
+        pricePerThousandOutputTokens: 0.0006,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.000075,
+        pricePerThousandOutputTokens: 0.0003,
+      },
+    },
+  },
+
+  [Models.Gpt_4]: {
+    name: "GPT-4",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.03,
+        pricePerThousandOutputTokens: 0.06,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.015,
+        pricePerThousandOutputTokens: 0.03,
+      },
+    },
+  },
+
+  [Models.o3_Deep_Research]: {
+    name: "o3 Deep Research",
+    cost: {
+      // TODO: get actual price
+      onDemand: {
+        pricePerThousandInputTokens: 0.03,
+        pricePerThousandOutputTokens: 0.06,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.015,
+        pricePerThousandOutputTokens: 0.03,
+      },
+    },
+  },
+  [Models.o4_Mini_Deep_Research]: {
+    name: "o4 Mini Deep Research",
+    cost: {
+      // TODO: get actual price
+      onDemand: {
+        pricePerThousandInputTokens: 0.03,
+        pricePerThousandOutputTokens: 0.06,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.015,
+        pricePerThousandOutputTokens: 0.03,
+      },
+    },
+  },
+  [Models.CohereCmdRPlus]: {
+    name: "Command R+",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0025,
+        pricePerThousandOutputTokens: 0.01,
+      },
+    },
+  },
+  [Models.CohereCmdR]: {
+    name: "Command R",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00015,
+        pricePerThousandOutputTokens: 0.0006,
+      },
+    },
+  },
+  [Models.Claude_3_7_Sonnet]: {
+    name: "Claude 3.7 Sonnet",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.003,
+        pricePerThousandOutputTokens: 0.015,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0,
+        pricePerThousandOutputTokens: 0,
+      },
+    },
+  },
+  [Models.Claude_3_5_SonnetV2]: {
+    name: "Claude 3.5 Sonnet v2",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.003,
+        pricePerThousandOutputTokens: 0.015,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.0015,
+        pricePerThousandOutputTokens: 0.0075,
+      },
+    },
+  },
+  [Models.Claude_3_5_Sonnet]: {
+    name: "Claude 3.5 Sonnet",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.003,
+        pricePerThousandOutputTokens: 0.015,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.0015,
+        pricePerThousandOutputTokens: 0.0075,
+      },
+    },
+  },
+  [Models.Claude_Opus_4]: {
+    name: "Claude Opus 4",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.015,
+        pricePerThousandOutputTokens: 0.075,
+      },
+    },
+  },
+  [Models.Claude_Sonnet_4]: {
+    name: "Claude Sonnet 4",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.003,
+        pricePerThousandOutputTokens: 0.015,
+      },
+    },
+  },
+  [Models.Claude_3_5_Haiku]: {
+    name: "Claude 3.5 Haiku",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.001,
+        pricePerThousandOutputTokens: 0.005,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.0005,
+        pricePerThousandOutputTokens: 0.0025,
+      },
+    },
+  },
+  [Models.DeepSeek_R1]: {
+    name: "Deepseek R1 (v1:0)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00135,
+        pricePerThousandOutputTokens: 0.0054,
+      },
+    },
+  },
+  [Models.Amazon_Nova_Micro]: {
+    name: "Amazon Nova Micro",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.000035,
+        pricePerThousandOutputTokens: 0.00014,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.0000175,
+        pricePerThousandOutputTokens: 0.00007,
+      },
+    },
+  },
+  [Models.Amazon_Nova_Lite]: {
+    name: "Amazon Nova Lite",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00006,
+        pricePerThousandOutputTokens: 0.00024,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.00003,
+        pricePerThousandOutputTokens: 0.00012,
+      },
+    },
+  },
+  [Models.Amazon_Nova_Pro]: {
+    name: "Amazon Nova Pro",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0008,
+        pricePerThousandOutputTokens: 0.0032,
+      },
+      batch: {
+        pricePerThousandInputTokens: 0.0004,
+        pricePerThousandOutputTokens: 0.0016,
+      },
+    },
+  },
+  [Models.Mistral_Large]: {
+    name: "Mistral Large (24.02)",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.004,
+        pricePerThousandOutputTokens: 0.012,
+      },
+    },
+  },
+  [getActualModelName(Models.Vertex_Claude_Sonnet_4)]: {
+    name: "vertex-claude-sonnet-4",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.003,
+        pricePerThousandOutputTokens: 0.015,
+      },
+    },
+  },
+  [getActualModelName(Models.Vertex_Gemini_2_5_Flash)]: {
+    name: "vertex-gemini-2-5-flash",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0003,
+        pricePerThousandOutputTokens: 0.0025,
+      },
+    },
+  },
+  [getActualModelName(Models.Vertex_Gemini_2_5_Pro)]: {
+    name: "vertex-gemini-2-5-pro",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00125,
+        pricePerThousandOutputTokens: 0.01,
+      },
+    },
+  },
+  [getActualModelName(Models.Vertex_Gemini_3_Pro)]: {
+    name: "vertex-gemini-3-pro-preview",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.00125,
+        pricePerThousandOutputTokens: 0.01,
+      },
+    },
+  },
+  [getActualModelName(Models.Vertex_Gemini_3_Flash)]: {
+    name: "vertex-gemini-3-flash-preview",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0003,
+        pricePerThousandOutputTokens: 0.0025,
+      },
+    },
+  },
+  [getActualModelName(Models.KIMI_LATEST)]: {
+    name: "kimi-latest",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.PRIVATE_LARGE)]: {
+    name: "private-large",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.GLM_LATEST)]: {
+    name: "glm-latest",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.0000022,
+      },
+    },
+  },
+  [getActualModelName(Models.GLM_45_AIR)]: {
+    name: "glm-45-air-curriculum-learning",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.GLM_FLASH)]: {
+    name: "glm-flash-experimental",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.GLM_PRIVATE)]: {
+    name: "glm-private",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.OPEN_LARGE)]: {
+    name: "open-large",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.0000022,
+      },
+    },
+  },
+  [getActualModelName(Models.DEEPSEEK)]: {
+    name: "deepseek",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.MINIMAX_2_5)]: {
+    name: "minimax-2-5",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.MINIMAX_M2)]: {
+    name: "minimax-m2",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.OPEN_FAST)]: {
+    name: "open-fast",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.LiteLLM_Claude_Sonnet_4_6)]: {
+    name: "claude-sonnet-4-6",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.003,
+        pricePerThousandOutputTokens: 0.015,
+      },
+    },
+  },
+  [getActualModelName(Models.LiteLLM_Claude_Opus_4_6)]: {
+    name: "claude-opus-4-6",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.005,
+        pricePerThousandOutputTokens: 0.025,
+      },
+    },
+  },
+  [getActualModelName(Models.LiteLLM_Claude_Haiku_4_5)]: {
+    name: "claude-haiku-4-5",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0008,
+        pricePerThousandOutputTokens: 0.004,
+      },
+    },
+  },
+  [getActualModelName(Models.LiteLLM_Gemini_3_Flash)]: {
+    name: "gemini-3-flash-preview",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0005,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+  [getActualModelName(Models.NEMOTRON)]: {
+    name: "nemotron",
+    cost: {
+      onDemand: {
+        pricePerThousandInputTokens: 0.0006,
+        pricePerThousandOutputTokens: 0.000003,
+      },
+    },
+  },
+}
+
+export const ModelToProviderMap: Record<Models, AIProviders> = {
+  [Models.Llama_3_1_405B]: AIProviders.AwsBedrock,
+  [Models.Llama_3_1_70B]: AIProviders.AwsBedrock,
+  [Models.Llama_3_2_3B]: AIProviders.AwsBedrock,
+  [Models.Llama_3_2_1B]: AIProviders.AwsBedrock,
+  [Models.Llama_3_1_8B]: AIProviders.AwsBedrock,
+  [Models.Gpt_4o]: AIProviders.OpenAI,
+  [Models.Gpt_4o_mini]: AIProviders.OpenAI,
+  [Models.Gpt_4]: AIProviders.OpenAI,
+  [Models.o3_Deep_Research]: AIProviders.OpenAI,
+  [Models.o4_Mini_Deep_Research]: AIProviders.OpenAI,
+  [Models.CohereCmdRPlus]: AIProviders.AwsBedrock,
+  [Models.CohereCmdR]: AIProviders.AwsBedrock,
+  [Models.Claude_3_5_SonnetV2]: AIProviders.AwsBedrock,
+  [Models.Claude_3_7_Sonnet]: AIProviders.AwsBedrock,
+  [Models.Claude_3_5_Sonnet]: AIProviders.AwsBedrock,
+  [Models.Claude_3_5_Haiku]: AIProviders.AwsBedrock,
+  [Models.Claude_Opus_4]: AIProviders.AwsBedrock,
+  [Models.Claude_Sonnet_4]: AIProviders.AwsBedrock,
+  [Models.Amazon_Nova_Micro]: AIProviders.AwsBedrock,
+  [Models.Amazon_Nova_Lite]: AIProviders.AwsBedrock,
+  [Models.Amazon_Nova_Pro]: AIProviders.AwsBedrock,
+  [Models.Mistral_Large]: AIProviders.AwsBedrock,
+  [Models.DeepSeek_R1]: AIProviders.AwsBedrock,
+  [Models.Gemini_2_5_Flash]: AIProviders.GoogleAI,
+  [Models.Gemini_2_0_Flash_Thinking]: AIProviders.GoogleAI,
+
+  [Models.Vertex_Claude_Sonnet_4]: AIProviders.VertexAI,
+  [Models.Vertex_Gemini_2_5_Pro]: AIProviders.VertexAI,
+  [Models.Vertex_Gemini_2_5_Flash]: AIProviders.VertexAI,
+  [Models.Vertex_Gemini_3_Pro]: AIProviders.VertexAI,
+  [Models.Vertex_Gemini_3_Flash]: AIProviders.VertexAI,
+  [Models.LiteLLM_Claude_Sonnet_4_6]: AIProviders.LiteLLM,
+  [Models.LiteLLM_Claude_Opus_4_6]: AIProviders.LiteLLM,
+  [Models.LiteLLM_Claude_Haiku_4_5]: AIProviders.LiteLLM,
+  [Models.LiteLLM_Gemini_3_Flash]: AIProviders.LiteLLM,
+  [Models.KIMI_LATEST]: AIProviders.LiteLLM,
+  [Models.PRIVATE_LARGE]: AIProviders.LiteLLM,
+  [Models.GLM_LATEST]: AIProviders.LiteLLM,
+  [Models.GLM_FLASH]: AIProviders.LiteLLM,
+  [Models.GLM_PRIVATE]: AIProviders.LiteLLM,
+  [Models.GLM_45_AIR]: AIProviders.LiteLLM,
+  [Models.OPEN_LARGE]: AIProviders.LiteLLM,
+  [Models.DEEPSEEK]: AIProviders.LiteLLM,
+  [Models.MINIMAX_2_5]: AIProviders.LiteLLM,
+  [Models.MINIMAX_M2]: AIProviders.LiteLLM,
+  [Models.OPEN_FAST]: AIProviders.LiteLLM,
+  [Models.NEMOTRON]: AIProviders.LiteLLM,
+  [Models.GEMMA_4]: AIProviders.LiteLLM,
+}
+
+export const isDeepResearchModel = (modelId: Models): boolean => {
+  return (
+    modelId === Models.o3_Deep_Research ||
+    modelId === Models.o4_Mini_Deep_Research
+  )
+}

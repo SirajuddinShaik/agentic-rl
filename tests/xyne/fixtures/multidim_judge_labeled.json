@@ -1,0 +1,23 @@
+[
+  {
+    "id": "fully_grounded",
+    "question": "What is the leave cap?",
+    "answer": "The leave cap is ten days.",
+    "citation": "The policy caps rollover at ten days.",
+    "label": {"quality": 1.0, "correctness": 1.0, "groundedness": 1.0, "citation_accuracy": 1.0}
+  },
+  {
+    "id": "partially_grounded",
+    "question": "What is the leave cap?",
+    "answer": "The leave cap is ten days, and all leave is paid out monthly.",
+    "citation": "The policy caps rollover at ten days.",
+    "label": {"quality": 0.5, "correctness": 0.5, "groundedness": 0.5, "citation_accuracy": 0.5}
+  },
+  {
+    "id": "unsupported",
+    "question": "What is the leave cap?",
+    "answer": "There is no leave cap and the policy is unlimited.",
+    "citation": "The policy caps rollover at ten days.",
+    "label": {"quality": 0.0, "correctness": 0.0, "groundedness": 0.0, "citation_accuracy": 0.0}
+  }
+]

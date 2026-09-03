@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""Standalone fetcher that drives one agentic Xyne run and writes a raw-flow JSON.
+
+Standalone (stdlib only). Orchestrates HTTP calls against the Xyne backend
+(``/v2/chat/*``), authenticating with a JWT access-token cookie (the backend's
+AuthMiddleware validates ``access-token``; x-api-key alone is not accepted).
+
+The agentic answer runs asynchronously: ``POST /conversations/:id/messages``
+returns a runId immediately while the turn continues in the background, so this
+fetcher polls ``GET /conversations/:id/messages`` until the assistant final
+answer appears, then extracts it.
+
+The backend never sees the LLM directly through this script: Xyne's own
+LiteLLM call (``LITELLM_BASE_URL``) flows through Polar's gateway proxy, which
+captures the completions that build the trajectory.
+
+Emitted keys match ``polar.xyne.types.XyneRawFlow`` exactly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import unicodedata
+from typing import Any
+
+_HEALTH_PATH = "/v2/health"
+_CONVERSATIONS_PATH = "/v2/chat/conversations"
+_DEBUG_EVENTS_PATH = "/v2/chat/conversations/{conversation_id}/debug-events"
+_NESTED_RUNS_PATH = "/v2/chat/conversations/{conversation_id}/runs/{parent_run_id}/nested"
+_DUMP_PATH = "/v2/chat/conversations/{conversation_id}/dump"
+_ACCESS_COOKIE = "access-token"
+
+_POLL_INTERVAL_S = 2.0
+_POLL_TIMEOUT_S = float(os.environ.get("XYNE_POLL_TIMEOUT_SECONDS", "1800"))
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    api_key: str | None = None,
+    access_token: str | None = None,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+) -> tuple[int, Any]:
+    """Perform one HTTP request and return (status, parsed-JSON-or-None)."""
+    data: bytes | None = None
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if access_token:
+        headers["Cookie"] = f"{_ACCESS_COOKIE}={access_token}"
+    elif api_key:
+        headers["x-api-key"] = api_key
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = int(response.getcode())
+            body = response.read().decode("utf-8", errors="replace")
+            parsed: Any = None
+            if body.strip():
+                parsed = json.loads(body)
+            return status, parsed
+    except urllib.error.HTTPError as exc:
+        try:
+            parsed = json.loads(exc.read().decode("utf-8", errors="replace"))
+        except (ValueError, OSError):
+            parsed = None
+        return int(exc.code), parsed
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return 0, {"_transport_error": str(exc)}
+
+
+def _request_messages(instruction: str) -> list[dict[str, Any]]:
+    return [{"role": "user", "content": instruction}]
+
+
+def _as_items(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    for key in ("items", "messages"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [v for v in value if isinstance(v, dict)]
+    return []
+
+
+def _text_of(block: Any) -> str:
+    if isinstance(block, dict):
+        if isinstance(block.get("text"), str):
+            return block["text"]
+        content = block.get("content")
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict) and isinstance(c.get("text"), str):
+                    parts.append(c["text"])
+                elif isinstance(c, str):
+                    parts.append(c)
+            return "".join(parts)
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def _item_text(item: dict[str, Any] | None) -> str:
+    if not item:
+        return ""
+    direct = item.get("text")
+    if isinstance(direct, str):
+        return direct
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    blocks = item.get("blocks")
+    if isinstance(blocks, list):
+        return "".join(_text_of(b) for b in blocks)
+    if isinstance(content, list):
+        return "".join(
+            _text_of(c) for c in content if isinstance(c, dict) or isinstance(c, str)
+        )
+    return ""
+
+
+def _final_assistant_answer(items: list[dict[str, Any]]) -> tuple[str, str]:
+    """Return (answer_text, assistant_message_id) for the last complete assistant msg."""
+    answer = ""
+    msg_id = ""
+    for item in items:
+        if item.get("role") != "assistant":
+            continue
+        blocks = item.get("blocks")
+        if isinstance(blocks, list):
+            text = "".join(
+                block.get("text", "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("kind") == "text"
+            )
+        else:
+            text = _item_text(item)
+        if text.strip():
+            answer = text
+            msg_id = str(item.get("id") or "")
+    return answer, msg_id
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="xyne_fetch_flow",
+        description=(
+            "Drive one agentic Xyne run against the Xyne HTTP API and write the "
+            "raw-flow JSON to --output."
+        ),
+    )
+    parser.add_argument(
+        "--instruction", required=True, help="User instruction to send to Xyne."
+    )
+    parser.add_argument(
+        "--output", required=True, help="Runtime path to write the raw-flow JSON to."
+    )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("XYNE_BASE_URL", "http://localhost:3000"),
+        help="Xyne backend base URL (default: http://localhost:3000).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("XYNE_API_KEY", ""),
+        help="Legacy x-api-key header (fallback when no access-token).",
+    )
+    parser.add_argument(
+        "--access-token",
+        default=os.environ.get("XYNE_ACCESS_TOKEN", ""),
+        help="JWT access token sent as the access-token cookie.",
+    )
+    parser.add_argument(
+        "--agent-id",
+        default=os.environ.get("XYNE_AGENT_ID", ""),
+        help="Xyne agent external ID to run (required for agent-scoped tools).",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=30.0, help="Per-request timeout seconds."
+    )
+    args = parser.parse_args(argv)
+
+    access_token = args.access_token or None
+    api_key = args.api_key or None
+    base_url = args.base_url.rstrip("/")
+    wall_start = time.monotonic()
+
+    flow: dict[str, Any] = {
+        "conversation_id": "",
+        "run_id": "",
+        "request_messages": _request_messages(args.instruction),
+        "answer": "",
+        "citations": [],
+        "finish_reason": None,
+        "debug_events": [],
+        "nested_runs": [],
+        "error": None,
+        "latency_ms": 0.0,
+        "wall_clock_ms": 0.0,
+        "metadata": {},
+        "tool_events": [],
+        "retrieved_chunks": [],
+    }
+
+    # 1. Create the conversation.
+    status, conversation = _http_json(
+        "POST",
+        f"{base_url}{_CONVERSATIONS_PATH}",
+        api_key=api_key,
+        access_token=access_token,
+        payload={"messages": flow["request_messages"]},
+        timeout=args.timeout,
+    )
+    if not isinstance(conversation, dict) or status >= 400:
+        flow["error"] = (
+            f"create conversation failed (status={status}): "
+            f"{_safe(conversation)}"
+        )
+        return _finish(flow, wall_start, args.output)
+
+    conversation_id = (
+        str(conversation.get("id") or conversation.get("conversation_id") or "")
+    )
+    flow["conversation_id"] = conversation_id
+    if not conversation_id:
+        flow["error"] = f"create conversation returned no id: {_safe(conversation)}"
+        return _finish(flow, wall_start, args.output)
+
+    # 2. Send the instruction and start the agentic turn.
+    message_path = f"{base_url}{_CONVERSATIONS_PATH}/{conversation_id}/messages"
+    send_start = time.monotonic()
+    status, answer_payload = _http_json(
+        "POST",
+        message_path,
+        api_key=api_key,
+        access_token=access_token,
+        payload={
+            "text": args.instruction,
+            "debug": True,
+            "debugVerbosity": "detailed",
+            **({"agentId": args.agent_id} if args.agent_id else {}),
+        },
+        timeout=args.timeout,
+    )
+    flow["latency_ms"] = (time.monotonic() - send_start) * 1000.0
+
+    if not isinstance(answer_payload, dict) or status >= 400:
+        flow["error"] = (
+            f"send message failed (status={status}): {_safe(answer_payload)}"
+        )
+        return _finish(flow, wall_start, args.output)
+
+    # runId surfaced on the assistantMessage of the async start response.
+    am = answer_payload.get("assistantMessage")
+    if isinstance(am, dict):
+        run_id = am.get("runId") or am.get("run_id") or am.get("id")
+    else:
+        run_id = answer_payload.get("runId") or answer_payload.get("run_id")
+    flow["run_id"] = str(run_id or "")
+
+    citations = []
+    for src in (answer_payload.get("citations"), (am or {}).get("citations")):
+        if isinstance(src, list):
+            citations.extend(c for c in src if isinstance(c, dict))
+    flow["citations"] = citations
+
+    finish_reason = answer_payload.get("finishReason", answer_payload.get("finish_reason"))
+    if isinstance(finish_reason, str):
+        flow["finish_reason"] = finish_reason
+
+    # 3. Wait for the async agentic turn to produce the assistant's final answer.
+    items: list[dict[str, Any]] = []
+    answer, ans_msg_id = "", ""
+    poll_start = time.monotonic()
+    while time.monotonic() - poll_start < _POLL_TIMEOUT_S:
+        time.sleep(_POLL_INTERVAL_S)
+        st, msgs = _http_json(
+            "GET", message_path, api_key=api_key, access_token=access_token,
+            timeout=args.timeout,
+        )
+        if st < 400:
+            items = _as_items(msgs)
+            answer, ans_msg_id = _final_assistant_answer(items)
+            if answer:
+                # A non-empty assistant text block is the completion signal.
+                # Some deployments do not expose a populated dump endpoint;
+                # when they do, also avoid accepting a non-terminal snapshot.
+                candidate_dump = _fetch_dump(
+                    base_url, conversation_id, api_key, access_token,
+                    timeout=args.timeout,
+                )
+                if not candidate_dump or _main_run_terminal(candidate_dump, flow["run_id"]):
+                    break
+    flow["metadata"]["messages"] = items
+    if not answer:
+        flow["error"] = (
+            flow["error"]
+            or f"no final answer within {int(_POLL_TIMEOUT_S)}s "
+            f"(conversation={conversation_id}, run={flow['run_id']})"
+        )
+    else:
+        flow["answer"] = answer
+        flow["metadata"]["assistant_message_id"] = ans_msg_id
+
+    # 4. Fetch debug events (empty when the backend does not expose them).
+    debug_url = (
+        f"{base_url}{_DEBUG_EVENTS_PATH.format(conversation_id=conversation_id)}"
+    )
+    if flow["run_id"]:
+        debug_url += f"?runId={urllib.parse.quote(flow['run_id'])}"
+    debug_status, debug_payload = _http_json(
+        "GET", debug_url, api_key=api_key, access_token=access_token,
+        timeout=args.timeout,
+    )
+    if 0 < debug_status < 400 and isinstance(debug_payload, dict):
+        events = debug_payload.get("events")
+        if isinstance(events, list):
+            flow["debug_events"] = [e for e in events if isinstance(e, dict)]
+
+    flow["nested_runs"] = _extract_nested_runs(debug_payload)
+
+    if flow["run_id"]:
+        # debug-events does not carry the sub-agent tree; hit the M8 endpoint.
+        nested_url = (
+            f"{base_url}"
+            f"{_NESTED_RUNS_PATH.format(conversation_id=conversation_id, parent_run_id=urllib.parse.quote(flow['run_id']))}"
+        )
+        nested_status, nested_payload = _http_json(
+            "GET", nested_url, api_key=api_key, access_token=access_token,
+            timeout=args.timeout,
+        )
+        if 0 < nested_status < 400:
+            if isinstance(nested_payload, dict):
+                nested_payload = nested_payload.get("nestedRuns", [])
+            if isinstance(nested_payload, list):
+                flow["nested_runs"] = [
+                    e for e in nested_payload if isinstance(e, dict)
+                ]
+
+    # 5. Fetch the full-turn DB dump and assemble one unified result object.
+    dump = _fetch_dump(
+        base_url, conversation_id, api_key, access_token, timeout=args.timeout
+    )
+    if not dump:
+        # Some Xyne deployments do not expose the DB dump route. The messages
+        # endpoint still contains the complete assistant blocks, including
+        # thinking, tool_use, tool_result and final text.
+        dump = {"messages": items, "runs": [], "toolCalls": []}
+        flow["metadata"]["dump_source"] = "messages_fallback"
+    unified = _build_unified_result(
+        dump,
+        flow["debug_events"],
+        flow["nested_runs"],
+        initial_citations=flow["citations"],
+    )
+    flow.update(unified)
+
+    return _finish(flow, wall_start, args.output)
+
+
+def _extract_nested_runs(debug_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(debug_payload, dict):
+        return []
+    combined: list[dict[str, Any]] = []
+    for key in ("nested_runs", "nestedRuns", "runs"):
+        value = debug_payload.get(key)
+        if isinstance(value, list):
+            combined.extend(v for v in value if isinstance(v, dict))
+    # The sub-agent tree is also exposed per tool-call event; the debug-events
+    # payload carries it under each event's nestedRuns/nested_runs/runs/subRuns.
+    for key in ("events", "debugEvents"):
+        value = debug_payload.get(key)
+        if isinstance(value, list):
+            combined.extend(_extract_nested_runs_from_events(value))
+    return combined
+
+
+def _extract_nested_runs_from_events(events: list[Any]) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for key in ("nested_runs", "nestedRuns", "runs", "subRuns"):
+            value = event.get(key)
+            if isinstance(value, list):
+                runs.extend(v for v in value if isinstance(v, dict))
+    return runs
+
+
+def _fetch_dump(
+    base_url: str,
+    conversation_id: str,
+    api_key: str | None,
+    access_token: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    """Fetch the full-turn DB snapshot via GET /v2/chat/conversations/:id/dump.
+
+    Response shape: ``{conversation, messages, runs, toolCalls}``. Returns the
+    parsed dict (``{}`` on any transport/HTTP failure) with dictionary-style
+    access via ``.get()`` so downstream extraction is defensive.
+    """
+    if not conversation_id:
+        return {}
+    dump_url = f"{base_url}{_DUMP_PATH.format(conversation_id=conversation_id)}"
+    status, dump_payload = _http_json(
+        "GET", dump_url, api_key=api_key, access_token=access_token, timeout=timeout
+    )
+    if 0 < status < 400 and isinstance(dump_payload, dict):
+        return dump_payload
+    return {}
+
+
+def _main_run_terminal(dump: dict[str, Any], run_id: str) -> bool:
+    """Return whether the main run is terminal in a dump snapshot."""
+    runs = dump.get("runs")
+    if not isinstance(runs, list):
+        return True
+    matching = [
+        run for run in runs
+        if isinstance(run, dict) and (not run_id or run.get("id") == run_id)
+    ]
+    if not matching:
+        return True
+    terminal = {"completed", "failed", "cancelled", "canceled", "error", "aborted"}
+    for run in matching:
+        status = run.get("status")
+        if status is None:
+            continue
+        return str(status).lower() in terminal
+    # Legacy dump versions omit status; their assistant message is the only
+    # completion signal available, so preserve the old behavior.
+    return True
+
+
+def _main_assistant_answer(dump: dict[str, Any]) -> tuple[str, str]:
+    """Return the last persisted text answer from a main-run assistant message."""
+    messages = [m for m in dump.get("messages", []) if isinstance(m, dict)]
+    runs = [r for r in dump.get("runs", []) if isinstance(r, dict)]
+    nested_run_ids = {run.get("id") for run in runs if run.get("parentRunId")}
+    answer = ""
+    message_id = ""
+
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        if message.get("runId") in nested_run_ids:
+            continue
+        blocks = message.get("blocks")
+        if not isinstance(blocks, list):
+            continue
+        text = "".join(
+            block.get("text", "")
+            for block in blocks
+            if isinstance(block, dict) and block.get("kind") == "text"
+        )
+        if text.strip():
+            answer = text
+            message_id = str(message.get("id") or "")
+
+    return answer, message_id
+
+
+def _build_unified_result(
+    dump: dict[str, Any],
+    debug_events: list[dict[str, Any]],
+    nested_runs: list[dict[str, Any]],
+    initial_citations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Assemble one unified result object from the /dump snapshot plus supplements."""
+    messages = [
+        m for m in dump.get("messages", []) if isinstance(m, dict)
+    ]
+    runs = [r for r in dump.get("runs", []) if isinstance(r, dict)]
+    tool_calls_raw = [
+        t for t in dump.get("toolCalls", []) if isinstance(t, dict)
+    ]
+    nested_run_ids = {run.get("id") for run in runs if run.get("parentRunId")}
+
+    def _blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
+        blocks = msg.get("blocks")
+        if isinstance(blocks, list):
+            return [b for b in blocks if isinstance(b, dict)]
+        content = msg.get("content")
+        if isinstance(content, list):
+            return [c for c in content if isinstance(c, dict)]
+        return []
+
+    all_blocks: list[dict[str, Any]] = []
+    for msg in messages:
+        all_blocks.extend(_blocks(msg))
+
+    # Answer: joined text blocks of the last MAIN-run assistant message.
+    answer = ""
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        if msg.get("runId") in nested_run_ids:
+            continue
+        text = "".join(
+            b.get("text", "") for b in _blocks(msg) if b.get("kind") == "text"
+        )
+        if text.strip():
+            answer = text
+    if not isinstance(answer, str):
+        answer = str(answer)
+
+    # Citations: preserve API-provided records first. Answer-text citations are
+    # resolved after retrieval evidence is normalized below, because the
+    # agentic UI emits human-readable ``[title.pdf · chunk:N]`` references
+    # rather than the legacy ``[docId#N]`` form.
+    seen: set[tuple[str, int]] = set()
+    citations: list[dict[str, Any]] = []
+
+    def _add_citation(doc_id: Any, chunk: Any, **extra: Any) -> None:
+        if not isinstance(doc_id, str) or not doc_id.strip():
+            return
+        try:
+            chunk_int = int(chunk)
+        except (TypeError, ValueError):
+            return
+        key = (doc_id, chunk_int)
+        if key in seen:
+            return
+        seen.add(key)
+        record: dict[str, Any] = {"docId": doc_id, "chunk": chunk_int}
+        record.update({k: v for k, v in extra.items() if v not in (None, "")})
+        citations.append(record)
+
+    for citation in initial_citations or []:
+        if isinstance(citation, dict):
+            _add_citation(
+                citation.get("docId") or citation.get("itemId"),
+                citation.get("chunk", citation.get("chunkIndex", citation.get("index"))),
+                **{
+                    k: citation.get(k)
+                    for k in ("itemId", "snippet", "source_text", "relevance")
+                },
+            )
+
+    # tool_calls from the dump.toolCalls[] array.
+    tool_calls: list[dict[str, Any]] = []
+    for tc in tool_calls_raw:
+        tool_calls.append(
+            {
+                "toolCallId": tc.get("toolCallId") or tc.get("id"),
+                "toolName": tc.get("toolName"),
+                "args": tc.get("args"),
+                "result": tc.get("result"),
+                "isError": tc.get("isError"),
+                "status": tc.get("status"),
+                "startedAt": tc.get("startedAt"),
+                "completedAt": tc.get("completedAt"),
+            }
+        )
+
+    # tool_use / tool_result / thinking blocks across all messages.
+    tool_use_blocks: list[dict[str, Any]] = []
+    tool_result_blocks: list[dict[str, Any]] = []
+    thinking: list[str] = []
+    for block in all_blocks:
+        kind = block.get("kind")
+        if kind == "tool_use":
+            tool_use_blocks.append(
+                {
+                    "toolCallId": block.get("toolCallId"),
+                    "toolName": block.get("toolName"),
+                    "args": block.get("args"),
+                }
+            )
+        elif kind == "tool_result":
+            tool_result_blocks.append(
+                {
+                    "toolCallId": block.get("toolCallId"),
+                    "output": block.get("output"),
+                    "isError": block.get("isError"),
+                }
+            )
+        elif kind == "thinking":
+            text = block.get("text")
+            if isinstance(text, str):
+                thinking.append(text)
+
+    # Some backend versions persist results in /dump.toolCalls but omit a
+    # message-level tool_result block. Synthesize only missing IDs so the
+    # result is still available to reward functions and diagnostics.
+    result_ids = {
+        item.get("toolCallId") for item in tool_result_blocks
+        if isinstance(item, dict) and item.get("toolCallId")
+    }
+    for item in tool_calls:
+        call_id = item.get("toolCallId")
+        if call_id and call_id not in result_ids and item.get("result") is not None:
+            tool_result_blocks.append(
+                {
+                    "toolCallId": call_id,
+                    "output": item.get("result"),
+                    "isError": item.get("isError"),
+                    "source": "dump.toolCalls",
+                }
+            )
+
+    if not tool_calls:
+        results_by_id = {
+            item.get("toolCallId"): item
+            for item in tool_result_blocks
+            if item.get("toolCallId")
+        }
+        for use in tool_use_blocks:
+            call_id = use.get("toolCallId")
+            result = results_by_id.get(call_id, {})
+            tool_calls.append(
+                {
+                    "toolCallId": call_id,
+                    "toolName": use.get("toolName"),
+                    "args": use.get("args"),
+                    "result": result.get("output"),
+                    "isError": result.get("isError"),
+                    "status": "completed" if result else "pending",
+                    "source": "message_blocks",
+                }
+            )
+
+    tool_events = [
+        {
+            "toolCallId": item.get("toolCallId"),
+            "toolName": item.get("toolName"),
+            "args": item.get("args"),
+            "result": item.get("result"),
+            "isError": item.get("isError"),
+            "status": item.get("status"),
+            "startedAt": item.get("startedAt"),
+            "completedAt": item.get("completedAt"),
+        }
+        for item in tool_calls
+    ]
+    retrieved_chunks = _extract_retrieved_chunks(tool_calls)
+    evidence_by_key = {
+        (item.get("docId"), item.get("chunk")): item
+        for item in retrieved_chunks
+        if item.get("docId") and item.get("chunk") is not None
+    }
+    evidence_by_title_chunk = {
+        (_title_key(item.get("title")), item.get("chunk")): item
+        for item in retrieved_chunks
+        if _title_key(item.get("title")) and item.get("chunk") is not None
+    }
+
+    # Only the final answer establishes a citation. Tool output and thinking
+    # often contain doc/chunk identifiers but must not receive citation credit.
+    for match in _CITE_TOKEN_RE.finditer(answer):
+        _add_citation(match.group(1), match.group(2))
+    for match in _TITLE_CITE_RE.finditer(answer):
+        title, chunk_text = match.group(1).strip(), match.group(2)
+        normalized_title = _title_key(title)
+        if re.fullmatch(r"clf-[a-z0-9]+", normalized_title):
+            _add_citation(normalized_title, chunk_text)
+            continue
+        evidence = evidence_by_title_chunk.get((_title_key(title), int(chunk_text)))
+        if evidence is None:
+            # Xyne sometimes renders only the basename while Vespa returns a
+            # folder-qualified title. Resolve a unique suffix match safely.
+            candidates = [
+                item
+                for (candidate_title, candidate_chunk), item in evidence_by_title_chunk.items()
+                if candidate_chunk == int(chunk_text)
+                and (
+                    candidate_title.endswith(_title_key(title))
+                    or _title_key(title).endswith(candidate_title)
+                )
+            ]
+            if len(candidates) == 1:
+                evidence = candidates[0]
+        if evidence is None:
+            # Descriptive citations such as ``Appeal No. 5940 of 2024`` do
+            # not reproduce the stored path. Match only when the citation's
+            # identifying numbers select one retrieved title at this chunk.
+            numbers = set(re.findall(r"\d+", normalized_title))
+            if numbers:
+                candidates = [
+                    item
+                    for (candidate_title, candidate_chunk), item in evidence_by_title_chunk.items()
+                    if candidate_chunk == int(chunk_text)
+                    and numbers <= set(re.findall(r"\d+", candidate_title))
+                ]
+                if len(candidates) == 1:
+                    evidence = candidates[0]
+        if evidence is not None:
+            _add_citation(
+                evidence.get("docId"),
+                evidence.get("chunk"),
+                title=evidence.get("title") or title,
+            )
+
+    for citation in citations:
+        evidence = evidence_by_key.get((citation.get("docId"), citation.get("chunk")))
+        if evidence:
+            for key in ("snippet", "source_text", "title", "relevance"):
+                if key not in citation and evidence.get(key) not in (None, ""):
+                    citation[key] = evidence[key]
+
+    # sub_agents: every run with a parentRunId, plus its run-scoped messages.
+    sub_agents: list[dict[str, Any]] = []
+    for run in runs:
+        if run.get("parentRunId"):
+            run_id = run.get("id")
+            run_messages = [
+                m for m in messages if m.get("runId") == run_id
+            ]
+            sub_agents.append({"run": run, "messages": run_messages})
+
+    # token_usage from the last MAIN-run assistant message's stats.tokenUsage.
+    token_usage: dict[str, Any] = {}
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        if msg.get("runId") in nested_run_ids:
+            continue
+        stats = msg.get("stats")
+        if isinstance(stats, dict) and isinstance(stats.get("tokenUsage"), dict):
+            token_usage = stats["tokenUsage"]
+        break
+
+    return {
+        "raw_dump": dump,
+        "answer": answer,
+        "citations": citations,
+        "tool_calls": tool_calls,
+        "tool_use_blocks": tool_use_blocks,
+        "tool_result_blocks": tool_result_blocks,
+        "tool_events": tool_events,
+        "retrieved_chunks": retrieved_chunks,
+        "sub_agents": sub_agents,
+        "thinking": thinking,
+        "messages": messages,
+        "runs": runs,
+        "token_usage": token_usage,
+        "debug_events": debug_events,
+        "nested_runs": nested_runs,
+    }
+
+
+_ATTR_RE = re.compile(r'''([A-Za-z_][A-Za-z0-9_-]*)="([^"]*)"''')
+_CHUNKS_TAG_RE = re.compile(
+    r"<chunks\b([^>]*)>(.*?)</chunks>", re.IGNORECASE | re.DOTALL
+)
+_CHUNK_TAG_RE = re.compile(
+    r"<chunk\b([^>]*)>(.*?)</chunk>", re.IGNORECASE | re.DOTALL
+)
+_HIT_TAG_RE = re.compile(r"<hit\b([^>]*)>(.*?)</hit>", re.IGNORECASE | re.DOTALL)
+_TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_CITE_TOKEN_RE = re.compile(r"\[([^#\]\s]+)#(\d+)\]")
+_TITLE_CITE_RE = re.compile(
+    r"\[([^\[\]]*?\S)\s*(?:·|\||–|—|-|\\,\\,|,)?\s*"
+    r"chunk\s*:?\s*(\d+)[^0-9\]]*\]",
+    re.IGNORECASE,
+)
+
+
+def _title_key(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = unicodedata.normalize("NFKC", html.unescape(value))
+    text = text.translate(str.maketrans({
+        "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-",
+    }))
+    text = text.replace("\\_", "_").replace("\\-", "-")
+    text = text.strip().strip("*`").strip()
+    return re.sub(r"\s+", " ", text).casefold()
+
+
+def _clean_retrieval_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = html.unescape(value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:4000]
+
+
+def _extract_retrieved_chunks(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize search/getChunks results into doc/chunk evidence records."""
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add(
+        doc_id: Any,
+        chunk: Any,
+        *,
+        snippet: Any = None,
+        title: Any = None,
+        relevance: Any = None,
+    ) -> None:
+        if not isinstance(doc_id, str) or not doc_id.strip():
+            return
+        try:
+            chunk_int = int(chunk)
+        except (TypeError, ValueError):
+            return
+        key = (doc_id, chunk_int)
+        cleaned = _clean_retrieval_text(snippet)
+        if key in seen:
+            current = next(
+                item for item in records
+                if (item.get("docId"), item.get("chunk")) == key
+            )
+            if cleaned and not current.get("snippet"):
+                current["snippet"] = cleaned
+                current["source_text"] = cleaned
+            return
+        seen.add(key)
+        item: dict[str, Any] = {"docId": doc_id, "chunk": chunk_int}
+        if cleaned:
+            item["snippet"] = cleaned
+            item["source_text"] = cleaned
+        if isinstance(title, str) and title.strip():
+            item["title"] = title.strip()[:500]
+        if isinstance(relevance, (int, float)):
+            item["relevance"] = max(0.0, min(1.0, float(relevance)))
+        elif isinstance(relevance, str):
+            try:
+                item["relevance"] = max(0.0, min(1.0, float(relevance)))
+            except ValueError:
+                pass
+        records.append(item)
+
+    def walk(value: Any, inherited_doc: str | None = None) -> None:
+        if isinstance(value, dict):
+            doc_id = value.get("docId") or value.get("doc_id") or inherited_doc
+            chunk = value.get("chunk")
+            if chunk is None:
+                chunk = value.get(
+                    "chunkIndex", value.get("chunk_index", value.get("index"))
+                )
+            if doc_id is not None and chunk is not None:
+                snippet = (
+                    value.get("snippet")
+                    or value.get("source_text")
+                    or value.get("text")
+                )
+                add(
+                    doc_id,
+                    chunk,
+                    snippet=snippet,
+                    title=value.get("title"),
+                    relevance=value.get("score"),
+                )
+            for child in value.values():
+                walk(child, str(doc_id) if doc_id else inherited_doc)
+            return
+        if isinstance(value, list):
+            for child in value:
+                walk(child, inherited_doc)
+            return
+        if not isinstance(value, str):
+            return
+
+        for match in _CHUNKS_TAG_RE.finditer(value):
+            outer_attrs = dict(_ATTR_RE.findall(match.group(1)))
+            body = match.group(2)
+            outer_doc = outer_attrs.get("docId") or outer_attrs.get("doc_id") or inherited_doc
+            title_match = _TITLE_TAG_RE.search(body)
+            title = _clean_retrieval_text(title_match.group(1)) if title_match else None
+            for chunk_match in _CHUNK_TAG_RE.finditer(body):
+                attrs = dict(_ATTR_RE.findall(chunk_match.group(1)))
+                cite = _CITE_TOKEN_RE.search(attrs.get("cite", ""))
+                doc_id = (cite.group(1) if cite else None) or outer_doc
+                chunk = (
+                    (cite.group(2) if cite else None)
+                    or attrs.get("chunk_index")
+                    or attrs.get("index")
+                )
+                add(
+                    doc_id,
+                    chunk,
+                    snippet=chunk_match.group(2),
+                    title=title,
+                    relevance=attrs.get("score"),
+                )
+
+        for match in _HIT_TAG_RE.finditer(value):
+            attrs = dict(_ATTR_RE.findall(match.group(1)))
+            body = match.group(2)
+            title_match = _TITLE_TAG_RE.search(body)
+            title = _clean_retrieval_text(title_match.group(1)) if title_match else None
+            add(
+                attrs.get("docId") or attrs.get("doc_id") or inherited_doc,
+                attrs.get("chunk_index", attrs.get("chunkIndex", attrs.get("index"))),
+                snippet=body,
+                title=title,
+                relevance=attrs.get("score"),
+            )
+
+        for match in _CHUNK_TAG_RE.finditer(value):
+            attrs = dict(_ATTR_RE.findall(match.group(1)))
+            body = _clean_retrieval_text(match.group(2))
+            cite = _CITE_TOKEN_RE.search(attrs.get("cite", ""))
+            doc_id = (cite.group(1) if cite else None) or inherited_doc
+            chunk = (
+                (cite.group(2) if cite else None)
+                or attrs.get("chunk_index")
+                or attrs.get("index")
+            )
+            if doc_id and chunk is not None:
+                add(doc_id, chunk, snippet=body, relevance=attrs.get("score"))
+        for match in _CITE_TOKEN_RE.finditer(value):
+            add(match.group(1), match.group(2))
+
+    for call in tool_calls:
+        walk(call.get("result"), None)
+    return records
+
+
+def _finish(flow: dict[str, Any], wall_start: float, output: str) -> int:
+    flow["wall_clock_ms"] = (time.monotonic() - wall_start) * 1000.0
+    directory = os.path.dirname(output)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(output, "w", encoding="utf-8") as handle:
+        json.dump(flow, handle, ensure_ascii=False, indent=2)
+    return 0
+
+
+def _safe(value: Any) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)[:600]
+    return str(value)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

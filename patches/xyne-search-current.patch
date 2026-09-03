@@ -1,0 +1,496 @@
+diff --git a/deployment/ingestion/backup-vm.sh b/deployment/ingestion/backup-vm.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/ingestion/bin/count-docling-submitters.sh b/deployment/ingestion/bin/count-docling-submitters.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/ingestion/bin/scale-docling-submitters.sh b/deployment/ingestion/bin/scale-docling-submitters.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/ingestion/deploy-vm.sh b/deployment/ingestion/deploy-vm.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/ingestion/rollback-vm.sh b/deployment/ingestion/rollback-vm.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/monitoring-vm/recreate-vm-ocr-autoscaler.sh b/deployment/monitoring-vm/recreate-vm-ocr-autoscaler.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/monitoring-vm/simulation/sim-gcloud.sh b/deployment/monitoring-vm/simulation/sim-gcloud.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/setup-deployment.sh b/deployment/setup-deployment.sh
+old mode 100755
+new mode 100644
+diff --git a/deployment/setup-nvidia-toolkit.sh b/deployment/setup-nvidia-toolkit.sh
+old mode 100755
+new mode 100644
+diff --git a/doc/deploy.sh b/doc/deploy.sh
+old mode 100755
+new mode 100644
+diff --git a/e2b-template/start-up.sh b/e2b-template/start-up.sh
+old mode 100755
+new mode 100644
+diff --git a/lighton-ocr-server/deploy/gcp-c4-standard-16/create-fleet.sh b/lighton-ocr-server/deploy/gcp-c4-standard-16/create-fleet.sh
+old mode 100755
+new mode 100644
+diff --git a/server/app/agent/pi-mono/core/rag-agent.ts b/server/app/agent/pi-mono/core/rag-agent.ts
+index a5e86ea8..dbcd4b92 100644
+--- a/server/app/agent/pi-mono/core/rag-agent.ts
++++ b/server/app/agent/pi-mono/core/rag-agent.ts
+@@ -22,7 +22,7 @@ import { Subsystem } from "@/types"
+ 
+ const CLog = getLogger(Subsystem.Chat)
+ 
+-const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000 // 20 minutes
++const DEFAULT_TIMEOUT_MS = 8 * 60 * 60 * 1000 // 8h (SEBI fix: 20m aborted every agent turn under load)
+ 
+ export function resolveModel(
+   modelInput: string | Model<any>,
+@@ -51,12 +51,13 @@ export function resolveModel(
+     reasoning: options?.reasoning ?? false,
+     input: options?.input ?? ["text", "image"],
+     cost: options?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+-    contextWindow: options?.contextWindow ?? 128000,
++    contextWindow: options?.contextWindow ?? 100000,
+     maxTokens: options?.maxTokens ?? 4096,
+     compat: {
+       supportsStore: false,
+       supportsStreaming: true,
+       supportsToolStreaming: true,
++      supportsDeveloperRole: false,
+     },
+   } as Model<"openai-completions">
+ }
+@@ -300,6 +301,9 @@ export async function createRAGAgent<TState = unknown>(
+   const ragCompactionFactory = ragCompactionExtension({
+     model,
+     ...(config.apiKey ? { apiKey: config.apiKey } : {}),
++    ...(config.sessionId
++      ? { headers: { "x-session-id": config.sessionId } }
++      : {}),
+     ...(config.thinkingLevel !== undefined &&
+     (config.thinkingLevel as string) !== "off"
+       ? { thinkingLevel: config.thinkingLevel }
+@@ -630,7 +634,12 @@ export async function createRAGAgent<TState = unknown>(
+   const wantedTemp = config.streamOptions?.temperature
+   const wantedTopP = config.streamOptions?.topP
+   const debug = config.debug
+-  if (wantedTemp !== undefined || wantedTopP !== undefined || debug) {
++  if (
++    wantedTemp !== undefined ||
++    wantedTopP !== undefined ||
++    debug ||
++    config.sessionId !== undefined
++  ) {
+     const innerStreamFn = piSession.agent.streamFn
+     piSession.agent.streamFn = async (model, context, options) => {
+       const priorOnPayload = options?.onPayload
+@@ -686,6 +695,10 @@ export async function createRAGAgent<TState = unknown>(
+       return innerStreamFn(model, context, {
+         ...options,
+         ...(wantedTemp !== undefined ? { temperature: wantedTemp } : {}),
++        headers: {
++          ...(options?.headers ?? {}),
++          ...(config.sessionId ? { "x-session-id": config.sessionId } : {}),
++        },
+         onPayload,
+       })
+     }
+diff --git a/server/app/agent/pi-mono/core/types.ts b/server/app/agent/pi-mono/core/types.ts
+index 625114a9..ccb293c4 100644
+--- a/server/app/agent/pi-mono/core/types.ts
++++ b/server/app/agent/pi-mono/core/types.ts
+@@ -14,6 +14,7 @@ export interface RAGAgentConfig<TState = unknown> {
+   /** LiteLLM base URL (required when model is a string) */
+   baseUrl?: string
+   apiKey?: string
++  sessionId?: string | undefined
+ 
+   tools: ToolDefinition<any, any, any>[]
+ 
+diff --git a/server/app/agent/pi-mono/runner.ts b/server/app/agent/pi-mono/runner.ts
+index a4aa11e1..2440f790 100644
+--- a/server/app/agent/pi-mono/runner.ts
++++ b/server/app/agent/pi-mono/runner.ts
+@@ -357,6 +357,7 @@ export async function runPiMonoTurn(
+   const apiKey = config.LiteLLMApiKey ?? ""
+ 
+   const sessionManager = getOrCreateSession(args.conversationId)
++  const polarSessionId = args.message.match(/\[polar-session:([^\]]+)\]/)?.[1]
+ 
+   log.info(
+     {
+@@ -389,6 +390,7 @@ export async function runPiMonoTurn(
+     model: llmModelName,
+     baseUrl,
+     apiKey,
++    sessionId: polarSessionId,
+     // Tool list comes from the agent row's `tools` column; builder takes names
+     // literally ([] means "no tools").
+     tools: await (async () => {
+@@ -400,7 +402,7 @@ export async function runPiMonoTurn(
+         ...(args.agentScope ? { agentScope: args.agentScope } : {}),
+         // Same LiteLLM handle the main RAGAgent uses, so a tool's own LLM call
+         // (e.g. vespaSearch's in-tool relevance filter) hits the same model.
+-        llm: { model: llmModelName, baseUrl, apiKey },
++        llm: { model: llmModelName, baseUrl, apiKey, sessionId: polarSessionId },
+         ...(args.onToolProgress ? { onToolProgress: args.onToolProgress } : {}),
+       }
+       // @-mentioned docs need vespaSearch available even if the agent's set
+@@ -423,14 +425,14 @@ export async function runPiMonoTurn(
+           conversationId: args.conversationId,
+           ...(args.agentScope ? { agentScope: args.agentScope } : {}),
+           subAgents: subs,
+-          llm: { model: llmModelName, baseUrl, apiKey },
++          llm: { model: llmModelName, baseUrl, apiKey, sessionId: polarSessionId },
+           // No thinkingLevel here — each sub-agent carries its own
+           // (sub_agents.thinking_level), read off the resolved sub-agent.
+-          maxTokens: 64000,
++          maxTokens: 16384,
+           contextWindow,
+           reserveTokens,
+           keepRecentTokens,
+-          timeoutMs: 20 * 60 * 1000,
++          timeoutMs: 8 * 60 * 60 * 1000,
+           persistence: args.dispatchPersistence,
+           ...(args.onSubAgentStatus
+             ? { onSubAgentStatus: args.onSubAgentStatus }
+@@ -486,7 +488,7 @@ export async function runPiMonoTurn(
+     }),
+     modelOptions: {
+       contextWindow,
+-      maxTokens: 64000,
++      maxTokens: 16384,
+       reasoning: true,
+     },
+     // Per-model sampler params (e.g. Nemotron-120B → temp 1.0 / top_p 0.95).
+@@ -499,7 +501,7 @@ export async function runPiMonoTurn(
+     // to dodge its reasoning-truncation cliff) → "medium".
+     thinkingLevel: args.thinkingLevel ?? modelCfg?.thinkingLevel ?? "medium",
+     extensions: [],
+-    timeoutMs: 20 * 60 * 1000,
++    timeoutMs: 8 * 60 * 60 * 1000,
+   })
+ 
+   let text = ""
+@@ -622,7 +624,8 @@ export async function runPiMonoTurn(
+   const steers = [
+     injectReminder && attachmentReminder ? attachmentReminder : "",
+     args.citationReminder ?? "",
+-    args.preflightReminder ?? "",
++    // Pre-flight planning reminder disabled for RL/tool-calling flow by default.
++    process.env["BACKENDV2_PI_INJECT_PREFLIGHT"] === "true" ? args.preflightReminder ?? "" : "",
+     scopedDocsReminder,
+   ].filter((s) => s.length > 0)
+   const runMessage =
+diff --git a/server/app/agent/pi-mono/tools/dispatch-subagent.ts b/server/app/agent/pi-mono/tools/dispatch-subagent.ts
+index 002278b9..69baf497 100644
+--- a/server/app/agent/pi-mono/tools/dispatch-subagent.ts
++++ b/server/app/agent/pi-mono/tools/dispatch-subagent.ts
+@@ -311,7 +311,7 @@ async function runOneDispatch(
+       retry: { enabled: true, maxRetries: 2 },
+     }),
+     modelOptions: {
+-      contextWindow: ctx.contextWindow ?? 250000,
++      contextWindow: ctx.contextWindow ?? 100000,
+       maxTokens: ctx.maxTokens ?? 64000,
+       reasoning: true,
+     },
+diff --git a/server/app/agent/pi-mono/tools/registry.ts b/server/app/agent/pi-mono/tools/registry.ts
+index a4dce06c..3f077214 100644
+--- a/server/app/agent/pi-mono/tools/registry.ts
++++ b/server/app/agent/pi-mono/tools/registry.ts
+@@ -15,6 +15,7 @@ import { buildVespaSearchTool } from "./vespa/search"
+ import { buildDocumentSearchTool } from "./vespa/documentSearch"
+ import { buildProximitySearchTool } from "./vespa/proximitySearch"
+ import { buildSearchWithinDocTool } from "./vespa/searchWithinDoc"
++import { compactForLlm } from "./llmCompact"
+ import { buildComputerTool } from "./computer"
+ import { getSandboxManager } from "@/platform/lib/sandbox/manager"
+ 
+@@ -199,7 +200,7 @@ export const buildToolsForRun = (
+     if (!d) continue
+     // Skip a selected-but-unavailable tool (e.g. computer without the sandbox runtime).
+     if (d.available && !d.available(ctx)) continue
+-    built.push(d.build(ctx))
++    built.push(compactForLlm(d.build(ctx)))
+   }
+   return built
+ }
+diff --git a/server/app/agent/pi-mono/tools/vespa/searchCore.ts b/server/app/agent/pi-mono/tools/vespa/searchCore.ts
+index 899ff597..f8044ad2 100644
+--- a/server/app/agent/pi-mono/tools/vespa/searchCore.ts
++++ b/server/app/agent/pi-mono/tools/vespa/searchCore.ts
+@@ -146,9 +146,25 @@ const isNumericType = (dt: FieldDef["dataType"]): boolean =>
+ const renderLiteral = (
+   v: unknown,
+   dt: FieldDef["dataType"],
++  bound: "lower" | "upper" = "lower",
+ ): string | null => {
+   if (isNumericType(dt)) {
+-    if (typeof v === "number" && Number.isFinite(v)) return String(v)
++    // Accept model-sent strings for numeric/date fields instead of dropping
++    // them: a dropped clause silently unfilters the query and makes the agent
++    // think the filter failed, so it loops re-searching. Dates are stored as
++    // YYYYMMDD longs, so coerce ISO/loose strings via isoDateToInt; numbers
++    // accept numeric strings.
++    if (typeof v === "number") {
++      return Number.isFinite(v) ? String(v) : null
++    }
++    if (typeof v === "string" && v.trim().length > 0) {
++      if (dt === "date") {
++        const n = isoDateToInt(v, bound)
++        return n !== null ? String(n) : null
++      }
++      const n = Number(v.trim())
++      return Number.isFinite(n) ? String(n) : null
++    }
+     return null
+   }
+   if (dt === "boolean") {
+@@ -202,7 +218,11 @@ const clauseForFieldOp = (
+     case "gte":
+     case "lt":
+     case "lte": {
+-      const lit = renderLiteral(value, field.dataType)
++      const lit = renderLiteral(
++        value,
++        field.dataType,
++        op === "lt" || op === "lte" ? "upper" : "lower",
++      )
+       if (lit === null) return null
+       const sym = { gt: ">", gte: ">=", lt: "<", lte: "<=" }[op]
+       return `${f} ${sym} ${lit}`
+@@ -481,7 +501,12 @@ export const computeCursor = (
+ // but latency ~max(per-call) instead of one ~10s call, plus per-doc failure
+ // isolation (a failed call keeps that doc, the rest go through).
+ 
+-export type LlmHandle = { model: string; baseUrl: string; apiKey: string }
++export type LlmHandle = {
++  model: string
++  baseUrl: string
++  apiKey: string
++  sessionId?: string | undefined
++}
+ 
+ /** One candidate doc passed to the filter. Send FULL ai_summary + FULL chunk
+  *  text (no slicing): truncation was the main cause of wrong drops on legal
+@@ -632,6 +657,7 @@ const filterOneDoc = async (
+       headers: {
+         "Content-Type": "application/json",
+         Authorization: `Bearer ${llm.apiKey}`,
++        ...(llm.sessionId ? { "x-session-id": llm.sessionId } : {}),
+       },
+       body: JSON.stringify({
+         model: llm.model,
+diff --git a/server/app/agent/pi-mono/tools/vespa/searchWithinDoc.ts b/server/app/agent/pi-mono/tools/vespa/searchWithinDoc.ts
+index e56370d0..d1292088 100644
+--- a/server/app/agent/pi-mono/tools/vespa/searchWithinDoc.ts
++++ b/server/app/agent/pi-mono/tools/vespa/searchWithinDoc.ts
+@@ -23,6 +23,7 @@ import {
+   textResult,
+   titleOf,
+   topChunkIndex,
++  fallbackChunkIndex,
+ } from "./util"
+ 
+ const DESCRIPTION = [
+@@ -203,7 +204,7 @@ export const buildSearchWithinDocTool = (
+             docId: p.docId,
+           })
+ 
+-          const chunkIndex = topChunkIndex(fields)
++          const chunkIndex = topChunkIndex(fields) ?? fallbackChunkIndex(fields)
+           const snippet =
+             chunkIndex !== null ? snippetForChunk(fields, chunkIndex) : ""
+ 
+diff --git a/server/app/agent/pi-mono/tools/vespa/util.ts b/server/app/agent/pi-mono/tools/vespa/util.ts
+index 684ce5a4..47fdd383 100644
+--- a/server/app/agent/pi-mono/tools/vespa/util.ts
++++ b/server/app/agent/pi-mono/tools/vespa/util.ts
+@@ -106,6 +106,24 @@ export const topChunkIndices = (
+   return ranked.slice(0, n)
+ }
+ 
++// Fallback chunk index for keyword/lean hits that lack the semantic-only
++// `matchfeatures.chunk_scores`: use the first chunk the summary actually
++// materialized (chunks_pos_summary is ordered by relevance), else the hit's
++// plain `chunk_index` field, else null. Prevents searchWithinDoc from emitting
++// empty `chunk_index=""` hits that make the agent loop.
++export const fallbackChunkIndex = (
++  fields: Record<string, unknown>,
++): number | null => {
++  const pos = fields["chunks_pos_summary"]
++  if (Array.isArray(pos) && pos.length > 0) {
++    const first = pos[0]
++    if (typeof first === "number" && Number.isFinite(first)) return first
++  }
++  const ci = fields["chunk_index"]
++  if (typeof ci === "number" && Number.isFinite(ci)) return ci
++  return null
++}
++
+ // Positions map for a `lean`-summary hit (chunks pruned via select-elements-by).
+ // best_summary_chunks cell labels are the ORIGINAL element indices of the kept
+ // chunks; since the pruned array keeps document order, labels sorted ascending
+diff --git a/server/app/agent/routes/chat.ts b/server/app/agent/routes/chat.ts
+index aa17b7e8..230e1272 100644
+--- a/server/app/agent/routes/chat.ts
++++ b/server/app/agent/routes/chat.ts
+@@ -115,11 +115,13 @@ router.post("/conversations", (c) =>
+       title?: string
+       // Ephemeral conversations never appear in chat history.
+       ephemeral?: boolean
++      agentId?: string
+     }
+     const conv = await service.createConversation(
+       viewer(c),
+       body.title ?? "New chat",
+       body.ephemeral ? "ephemeral" : undefined,
++      body.agentId,
+     )
+     return conv
+   }),
+diff --git a/server/app/agent/services/nonAgenticAsk.ts b/server/app/agent/services/nonAgenticAsk.ts
+index e5333794..42e9536e 100644
+--- a/server/app/agent/services/nonAgenticAsk.ts
++++ b/server/app/agent/services/nonAgenticAsk.ts
+@@ -548,7 +548,7 @@ const directRAGMarkdownStream = async function* (
+       temperature: 0.2,
+       stream: true,
+     }),
+-    signal: combinedSignal(120_000, params.signal),
++    signal: combinedSignal(20 * 60 * 1000, params.signal),
+   })
+ 
+   if (!res.ok) {
+diff --git a/server/app/server.ts b/server/app/server.ts
+index b7b0fe44..f25eaa88 100644
+--- a/server/app/server.ts
++++ b/server/app/server.ts
+@@ -55,7 +55,7 @@ const Logger = getLogger(Subsystem.Api).child({ module: "backendv2" })
+ // Must match the callback host registered in the Google/Keycloak client config.
+ const PORT = Number(process.env["BACKENDV2_PORT"] ?? 3000)
+ const DEFAULT_IDLE_TIMEOUT_SECONDS = 240
+-const MAX_IDLE_TIMEOUT_SECONDS = 255
++const MAX_IDLE_TIMEOUT_SECONDS = 3600
+ const configuredIdleTimeoutSeconds = Number(
+   process.env["BACKENDV2_IDLE_TIMEOUT_SECONDS"],
+ )
+@@ -379,5 +379,5 @@ export default {
+     }
+     return app.fetch(request)
+   },
+-  idleTimeout: IDLE_TIMEOUT_SECONDS,
++  idleTimeout: Math.min(IDLE_TIMEOUT_SECONDS, 255),
+ }
+diff --git a/server/bun.lock b/server/bun.lock
+index 6b5eaf4d..f3983332 100644
+--- a/server/bun.lock
++++ b/server/bun.lock
+@@ -43,7 +43,7 @@
+         "@types/jszip": "^3.4.1",
+         "@types/node": "^24.3.0",
+         "@xyne/vespa-ts": "1.9.0",
+-        "@xyne/workflow-sdk": "3.2.25",
++        "@xyne/workflow-sdk": "3.2.29",
+         "ai": "^5.0.51",
+         "arctic": "^3.3.0",
+         "async-mutex": "^0.5.0",
+@@ -866,7 +866,7 @@
+ 
+     "@xyne/vespa-ts": ["@xyne/vespa-ts@1.9.0", "", { "dependencies": { "p-limit": "^6.2.0", "zod": "^4.0.15" }, "peerDependencies": { "typescript": "^5" } }, "sha512-A8AMo+8ysh0ijZ625QQBcEhvlTSAADUtH6Qe78Gbmf2EwxVLWx5R4wkPD5jsSSHk9uu81lXAXrkD+A+lTcrJGw=="],
+ 
+-    "@xyne/workflow-sdk": ["@xyne/workflow-sdk@3.2.25", "", { "dependencies": { "zod": "^3.25.76", "zod-to-json-schema": "^3.25.2" }, "peerDependencies": { "@earendil-works/pi-agent-core": ">=0.79.0", "@earendil-works/pi-ai": ">=0.79.0", "typebox": ">=1.1.0" }, "optionalPeers": ["@earendil-works/pi-agent-core", "@earendil-works/pi-ai", "typebox"] }, "sha512-FRUeXd0uh//9RnCmIkzl1NyMdWIri2RDbUev4eXiWD6eR53FNXouZcRIJV/8EojFeLTybsZxd/NyeKDF5M0JiQ=="],
++    "@xyne/workflow-sdk": ["@xyne/workflow-sdk@3.2.29", "", { "dependencies": { "zod": "^3.25.76", "zod-to-json-schema": "^3.25.2" }, "peerDependencies": { "@earendil-works/pi-agent-core": ">=0.79.0", "@earendil-works/pi-ai": ">=0.79.0", "typebox": ">=1.1.0" }, "optionalPeers": ["@earendil-works/pi-agent-core", "@earendil-works/pi-ai", "typebox"] }, "sha512-/pRulPt0SkKpuudQHrcDhxTLZTd6YDZ1Pc1nD/Wyugj1NqBaEOrAAgL6HGXcB/rBpPUpGzX0eeb+H8P0w1dgEQ=="],
+ 
+     "JSONStream": ["JSONStream@1.3.5", "", { "dependencies": { "jsonparse": "^1.2.0", "through": ">=2.2.7 <3" }, "bin": { "JSONStream": "./bin.js" } }, "sha512-E+iruNOY8VV9s4JEbe1aNEm6MiszPRr/UfcHMz0TQh1BXSxHK+ASV1R6W4HpjBhSeS+54PIsAMCBmwD06LLsqQ=="],
+ 
+diff --git a/server/config.ts b/server/config.ts
+index 9ee14685..1c1cb1e1 100644
+--- a/server/config.ts
++++ b/server/config.ts
+@@ -3,9 +3,9 @@ import { isURLValid } from "@/validate"
+ import { AuthType } from "@/platform/shared/types"
+ // Honor VESPA_HOST in dev too — the old "0.0.0.0" default worked by accident
+ // on loopback but elsewhere silently returns "no hits" instead of erroring.
+-let vespaBaseHost = process.env.VESPA_HOST || "0.0.0.0"
+-let vespaFeedPort = parseInt(process.env.VESPA_FEED_PORT || "8080", 10)
+-let vespaQueryPort = parseInt(process.env.VESPA_QUERY_PORT || "8081", 10)
++let vespaBaseHost = process.env.VESPA_HOST || "127.0.0.1"
++let vespaFeedPort = parseInt(process.env.VESPA_FEED_PORT || "18080", 10)
++let vespaQueryPort = parseInt(process.env.VESPA_QUERY_PORT || "18081", 10)
+ let postgresBaseHost = process.env.DATABASE_HOST || "0.0.0.0"
+ let port = process.env.PORT || 3000
+ let metricsPort = process.env.METRICS_PORT || 3001
+diff --git a/server/docker-init.sh b/server/docker-init.sh
+old mode 100755
+new mode 100644
+diff --git a/server/init-script.sh b/server/init-script.sh
+old mode 100755
+new mode 100644
+diff --git a/server/init-vespa.sh b/server/init-vespa.sh
+old mode 100755
+new mode 100644
+diff --git a/server/platform/ai/fetchModels.ts b/server/platform/ai/fetchModels.ts
+index f3cc2336..da395179 100644
+--- a/server/platform/ai/fetchModels.ts
++++ b/server/platform/ai/fetchModels.ts
+@@ -421,6 +421,12 @@ export const getAvailableModels = async (providerConfig: {
+       })
+   }
+ 
++  // Always expose the local Nemotron (RTX2 SGLang engine) so the catalog
++  // never comes back empty, even if the LiteLLM model-info call fails.
++  if (MODEL_CONFIGURATIONS[Models.NEMOTRON] && !availableModels.some((m) => m.id === Models.NEMOTRON)) {
++    availableModels.push(toAvailableModelConfig(Models.NEMOTRON, MODEL_CONFIGURATIONS[Models.NEMOTRON]))
++  }
++
+   const allowedModelIds = getAllowedModelIds()
+   return availableModels.filter((model) =>
+     isModelAllowed(allowedModelIds, model.id, model.actualName),
+diff --git a/server/platform/ai/modelConfig.ts b/server/platform/ai/modelConfig.ts
+index 0aa97999..8e0982a6 100644
+--- a/server/platform/ai/modelConfig.ts
++++ b/server/platform/ai/modelConfig.ts
+@@ -473,9 +473,9 @@ export const MODEL_CONFIGURATIONS: Record<Models, ModelConfiguration> = {
+       temperature: 1.0,
+       topP: 0.95,
+     },
+-    contextWindow: 200_000,
+-    reserveTokens: 40_192,
+-    keepRecentTokens: 50_000,
++    contextWindow: 64_000,
++    reserveTokens: 16_384,
++    keepRecentTokens: 40_960,
+     // "low" caps reasoning at ~300-600 tokens: above ~1k Nemotron hits a
+     // streaming-truncation cliff (stopReason "stop", empty visible text).
+     // UI Low/Medium/High picker overrides this.
+diff --git a/server/platform/vespa/deploy-demo.sh b/server/platform/vespa/deploy-demo.sh
+old mode 100755
+new mode 100644
+diff --git a/server/platform/vespa/deploy-docker.sh b/server/platform/vespa/deploy-docker.sh
+old mode 100755
+new mode 100644
+diff --git a/server/platform/vespa/deploy-pod.sh b/server/platform/vespa/deploy-pod.sh
+old mode 100755
+new mode 100644
+diff --git a/server/platform/vespa/deploy.sh b/server/platform/vespa/deploy.sh
+old mode 100755
+new mode 100644
+diff --git a/server/platform/vespa/reindex.sh b/server/platform/vespa/reindex.sh
+old mode 100755
+new mode 100644
+diff --git a/server/scripts/backup-database.sh b/server/scripts/backup-database.sh
+old mode 100755
+new mode 100644
+diff --git a/server/scripts/restore-database.sh b/server/scripts/restore-database.sh
+old mode 100755
+new mode 100644
+diff --git a/setup-local.sh b/setup-local.sh
+old mode 100755
+new mode 100644
+diff --git a/start.sh b/start.sh
+old mode 100755
+new mode 100644

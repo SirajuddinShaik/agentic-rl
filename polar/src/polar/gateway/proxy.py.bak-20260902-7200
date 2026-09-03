@@ -1,0 +1,435 @@
+"""HTTP client for forwarding requests to an OpenAI-compatible inference server.
+
+Backend differences (request params, response shape) are isolated in the
+``InferenceEngine`` strategy this client holds; the HTTP/streaming/pause logic
+here is backend-agnostic.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from typing import Any
+
+import httpx
+
+from polar.gateway.engine import InferenceEngine
+
+logger = logging.getLogger(__name__)
+
+# Default concurrent chat/completions into SGLang. Override via
+# POLAR_MAX_INFLIGHT_GENERATIONS. Engine durability (cuda-graph off, max_running,
+# max_tokens cap) must absorb this concurrency — do not serialize to 1.
+_DEFAULT_MAX_INFLIGHT = 64
+
+
+class UpstreamError(RuntimeError):
+    """Base class for upstream gateway failures."""
+
+
+class UpstreamHTTPError(UpstreamError):
+    """Raised when the upstream returns a non-2xx status."""
+
+    def __init__(self, status_code: int, body: dict[str, Any] | str | None = None):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(self._build_message(status_code, body))
+
+    @staticmethod
+    def _build_message(status_code: int, body: dict[str, Any] | str | None) -> str:
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return message
+            message = body.get("message")
+            if isinstance(message, str) and message:
+                return message
+        if isinstance(body, str) and body:
+            return body
+        return f"Upstream request failed with status {status_code}"
+
+
+class UpstreamTimeoutError(UpstreamError):
+    """Raised when the upstream times out."""
+
+
+class UpstreamTransportError(UpstreamError):
+    """Raised for connection and transport failures."""
+
+
+class InferenceClient:
+    """Direct httpx client to an inference server's OpenAI-compatible API.
+
+    Per-call bound comes from the session's remaining-timeout budget
+    (`_await_with_budget` at the gateway node). The internal httpx timeout
+    is a high liveness ceiling so that a stuck engine can't pin a request
+    past the session deadline. The ``engine`` strategy injects backend-specific
+    request params and canonicalizes responses.
+    """
+
+    # Liveness must exceed healthy slow generations under max_inflight=64.
+    # A 90s ceiling timed out live decodes and then soft-unwedged mid-flight,
+    # which repeatedly empty_cache'd busy engines and killed them.
+    _LIVENESS_TIMEOUT_SECONDS = float(os.environ.get("POLAR_INFERENCE_LIVENESS_TIMEOUT", "1200"))
+
+    def __init__(self, base_url: str, engine: InferenceEngine):
+        self.base_url = base_url.rstrip("/")
+        self.engine = engine
+        self._client: httpx.AsyncClient | None = None
+        self._generation_paused = False
+        self._inflight_generations = 0
+        self._generation_condition = asyncio.Condition()
+        self._last_soft_unwedge_mono = 0.0
+        self._soft_unwedge_lock = asyncio.Lock()
+        self._wedge_monitor_task: asyncio.Task[None] | None = None
+        try:
+            self._max_inflight_generations = max(
+                1, int(os.environ.get("POLAR_MAX_INFLIGHT_GENERATIONS", str(_DEFAULT_MAX_INFLIGHT)))
+            )
+        except (TypeError, ValueError):
+            self._max_inflight_generations = _DEFAULT_MAX_INFLIGHT
+        raw_engines = os.environ.get("POLAR_SGLANG_ENGINE_URLS", "").strip()
+        # When unset, probe the SAME engine this client serves (base_url) rather
+        # than stale RTX2 ports, so wedge health checks are coherent. Auto-unwedge
+        # itself is gated off by default (see start_wedge_monitor).
+        if not raw_engines:
+            raw_engines = self.base_url
+        self._engine_abort_urls = [
+            u.strip().rstrip("/") for u in raw_engines.split(",") if u.strip()
+        ]
+        logger.info(
+            "InferenceClient max_inflight_generations=%s liveness_timeout=%.0fs abort_engines=%s (base_url=%s)",
+            self._max_inflight_generations,
+            self._LIVENESS_TIMEOUT_SECONDS,
+            self._engine_abort_urls or "(none)",
+            self.base_url,
+        )
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=httpx.Timeout(self._LIVENESS_TIMEOUT_SECONDS, connect=30),
+            )
+        return self._client
+
+    async def _read_error_body(self, response: httpx.Response) -> dict[str, Any] | str | None:
+        content = await response.aread()
+        if not content:
+            return None
+
+        text = content.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+    async def _raise_for_status(self, response: httpx.Response) -> None:
+        if response.is_success:
+            return
+
+        body = await self._read_error_body(response)
+        await response.aclose()
+        raise UpstreamHTTPError(response.status_code, body)
+
+    @staticmethod
+    def _translate_transport_error(exc: httpx.RequestError) -> UpstreamError:
+        if isinstance(exc, httpx.TimeoutException):
+            return UpstreamTimeoutError("Upstream request timed out")
+        return UpstreamTransportError(f"Upstream request failed: {exc}")
+
+    async def completion(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Non-streaming chat completion. Returns the full JSON response."""
+        import time as _t
+        _st=_t.monotonic()
+        _m=request.get('model')
+        _mt=request.get('max_tokens')
+        print(f'[GWINST-completion-start] model={_m} max_tokens={_mt} inflight={self._inflight_generations} paused={self._generation_paused}', flush=True)
+        await self._acquire_generation_slot()
+        client = await self._get_client()
+        from copy import deepcopy
+
+        request_copy = deepcopy(request)
+        request_copy.pop("stream", None)
+        request_copy["stream"] = False
+        request_copy = self.engine.prepare_request(request_copy)
+        try:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=request_copy,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.TimeoutException as exc:
+            # Do NOT abort_all here (KeyError rid races under max_inflight=64).
+            # Soft-nudge continue_generation so a wedged scheduler can recover
+            # instead of holding util≈0 forever while Polar recycles dead slots.
+            logger.warning(
+                "Upstream chat timed out after %.0fs (inflight≈%s); soft-unwedge + release slot",
+                self._LIVENESS_TIMEOUT_SECONDS,
+                self._inflight_generations,
+            )
+            await self._abort_engine_orphans(reason="httpx_timeout")
+            raise self._translate_transport_error(exc) from exc
+        except httpx.RequestError as exc:
+            raise self._translate_transport_error(exc) from exc
+        finally:
+            await self._release_generation_slot()
+
+        await self._raise_for_status(resp)
+        print(f'[GWINST-completion-DONE] model={_m} elapsed={_t.monotonic()-_st:.1f}s', flush=True)
+        return self.engine.normalize_response(resp.json())
+
+    @staticmethod
+    def _parse_sglang_runtime_metrics(text: str) -> tuple[float, float, float]:
+        """Parse running/queued/throughput gauges from SGLang Prometheus text.
+
+        ``/server_info`` often omits runtime fields, so a probe that only reads
+        JSON always sees idle engines and soft-unwedges mid-decode.
+        """
+        running = queued = thr = 0.0
+        for line in text.splitlines():
+            if line.startswith("#") or " " not in line:
+                continue
+            name, _, rest = line.partition(" ")
+            # Strip prometheus labels: metric{...} value
+            metric = name.split("{", 1)[0]
+            try:
+                value = float(rest.strip().split()[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if metric == "sglang:num_running_reqs":
+                running = max(running, value)
+            elif metric == "sglang:num_queue_reqs":
+                queued = max(queued, value)
+            elif metric == "sglang:gen_throughput":
+                thr = max(thr, value)
+        return running, queued, thr
+
+    async def _engines_look_wedged(self, client: httpx.AsyncClient) -> bool:
+        """True when engines look idle/stuck OR scheduler-starved (queue ≫ running)."""
+        busy = 0
+        probed = 0
+        starved = 0
+        for url in self._engine_abort_urls:
+            try:
+                # Prefer /metrics — /server_info lacks num_running_reqs etc.
+                resp = await client.get(f"{url}/metrics")
+                if resp.status_code != 200:
+                    resp = await client.get(f"{url}/server_info")
+                    if resp.status_code != 200:
+                        continue
+                    info = resp.json()
+                    probed += 1
+                    running = float(info.get("num_running_reqs") or 0)
+                    queued = float(info.get("num_queue_reqs") or 0)
+                    thr = float(info.get("gen_throughput") or 0.0)
+                else:
+                    probed += 1
+                    running, queued, thr = self._parse_sglang_runtime_metrics(resp.text)
+                # Healthy parallel decode: many running OR high throughput.
+                if running > 0 or queued > 0 or thr > 1.0:
+                    busy += 1
+                # Scheduler wedge: deep queue but almost no active decodes.
+                if queued >= 8 and running <= 4 and thr < 120.0:
+                    starved += 1
+            except Exception:
+                continue
+        if probed == 0:
+            return False
+        if starved > 0:
+            return True
+        return busy == 0
+
+    async def start_wedge_monitor(self, interval_seconds: float = 30.0) -> None:
+        """Background probe: unwedge when gateway holds slots but engines look idle.
+
+        DISABLED by default. Under deep-queue rollout load (inflight == max) the
+        old 'starved' heuristic misfires and soft-unwedged live long agentic tool
+        generations (engine finish_reason=abort, prompt=0, completion=0 == empty
+        traces, zero rewards). Set POLAR_ENABLE_AUTO_UNWEDGE=1 to re-enable.
+        """
+        if os.environ.get("POLAR_ENABLE_AUTO_UNWEDGE", "0") != "1":
+            return
+        if self._wedge_monitor_task is not None:
+            return
+
+        async def _loop() -> None:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                if self._generation_paused or self._inflight_generations == 0:
+                    continue
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(10.0, connect=5.0)
+                    ) as client:
+                        wedged = await self._engines_look_wedged(client)
+                except Exception:
+                    continue
+                if wedged:
+                    logger.warning(
+                        "Background wedge probe: inflight=%s but engines idle/stuck; soft-unwedge",
+                        self._inflight_generations,
+                    )
+                    await self._abort_engine_orphans(reason="scheduler_starved")
+
+        self._wedge_monitor_task = asyncio.create_task(_loop())
+
+    async def stop_wedge_monitor(self) -> None:
+        task = self._wedge_monitor_task
+        self._wedge_monitor_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _abort_engine_orphans(self, *, reason: str) -> None:
+        """Debounced soft unwedge: continue_generation only when engines look wedged."""
+        if not self._engine_abort_urls:
+            return
+        import time as _time
+
+        async with self._soft_unwedge_lock:
+            now = _time.monotonic()
+            if now - self._last_soft_unwedge_mono < 60.0:
+                return
+            self._last_soft_unwedge_mono = now
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            try:
+                wedged = await self._engines_look_wedged(client)
+            except Exception as exc:
+                logger.warning("Engine wedge probe failed (%s); skip soft-unwedge", exc)
+                return
+            if not wedged:
+                logger.warning(
+                    "Upstream timeout (%s) but engines still decoding; skip soft-unwedge",
+                    reason,
+                )
+                return
+            logger.warning(
+                "Soft-unwedging SGLang engines via continue_generation (reason=%s urls=%s)",
+                reason,
+                self._engine_abort_urls,
+            )
+            for url in self._engine_abort_urls:
+                try:
+                    # Soft nudge ONLY. Do NOT abort_all in-flight requests here:
+                    # under a slow-but-active engine (deep queue, low throughput)
+                    # this wedge heuristic misfired and killed every long agentic
+                    # generation every 60s, zeroing rewards. Keep the scheduler
+                    # moving via continue_generation; a genuinely wedged engine is
+                    # recovered elsewhere (trainer pause) rather than by nuking live reqs.
+                    await client.post(
+                        f"{url}/continue_generation",
+                        json={},
+                        headers={"Content-Type": "application/json"},
+                    )
+                except Exception as exc:
+                    logger.warning("continue_generation failed for %s: %s", url, exc)
+
+    async def _acquire_generation_slot(self) -> None:
+        async with self._generation_condition:
+            await self._generation_condition.wait_for(
+                lambda: (not self._generation_paused)
+                and self._inflight_generations < self._max_inflight_generations
+            )
+            self._inflight_generations += 1
+
+    async def _release_generation_slot(self) -> None:
+        async with self._generation_condition:
+            self._inflight_generations -= 1
+            self._generation_condition.notify_all()
+
+    async def pause_generation(self, *, timeout_seconds: float = 300.0) -> dict[str, Any]:
+        """Block new generation requests and wait for current inference calls to drain.
+
+        On drain timeout, keep ``paused=True`` and drop the shared httpx client so
+        hung upstream POSTs fail fast and release ``_inflight_generations``. Miles
+        then aborts SGLang engines; without this cancel, drain never completes and
+        Polar keeps holding dead slots against a wedged scheduler.
+        """
+        client_to_close = None
+        timed_out = False
+        async with self._generation_condition:
+            self._generation_paused = True
+            self._generation_condition.notify_all()
+            try:
+                await asyncio.wait_for(
+                    self._generation_condition.wait_for(lambda: self._inflight_generations == 0),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                # Close outside the lock: completion finally → _release_generation_slot
+                # needs this same condition.
+                client_to_close = self._client
+                self._client = None
+                timed_out = True
+            else:
+                return self.generation_status()
+        if timed_out:
+            if client_to_close is not None and not client_to_close.is_closed:
+                await client_to_close.aclose()
+            raise TimeoutError(
+                f"Timed out waiting for inference requests to drain after {timeout_seconds}s"
+            )
+        return self.generation_status()
+
+    async def resume_generation(self) -> dict[str, Any]:
+        async with self._generation_condition:
+            self._generation_paused = False
+            self._generation_condition.notify_all()
+            return self.generation_status()
+
+    def generation_status(self) -> dict[str, Any]:
+        return {
+            "paused": self._generation_paused,
+            "inflight": self._inflight_generations,
+            "max_inflight": self._max_inflight_generations,
+            "base_url": self.base_url,
+            "engine": self.engine.name,
+        }
+
+    async def list_models(self) -> dict[str, Any]:
+        """Passthrough GET /v1/models."""
+        client = await self._get_client()
+        try:
+            resp = await client.get("/v1/models")
+        except httpx.RequestError as exc:
+            raise self._translate_transport_error(exc) from exc
+        await self._raise_for_status(resp)
+        return resp.json()
+
+    async def health(self) -> dict[str, Any]:
+        """Passthrough GET /health."""
+        client = await self._get_client()
+        try:
+            resp = await client.get("/health")
+        except httpx.RequestError as exc:
+            raise self._translate_transport_error(exc) from exc
+        await self._raise_for_status(resp)
+        content = await resp.aread()
+        if not content:
+            return {"status": "ok"}
+
+        text = content.decode("utf-8", errors="replace").strip()
+        if not text:
+            return {"status": "ok"}
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"status": "ok", "body": text}
+
+    async def close(self):
+        await self.stop_wedge_monitor()
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()

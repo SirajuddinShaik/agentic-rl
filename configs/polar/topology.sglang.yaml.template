@@ -1,0 +1,27 @@
+rollout:
+  host: ${POLAR_ROLLOUT_HOST}
+  port: ${POLAR_ROLLOUT_PORT}
+  public_url: ${POLAR_ROLLOUT_URL}
+  save_dir: ${POLAR_SAVE_DIR}
+  dispatch_poll_interval_seconds: 1.0
+  callback_grace_seconds: 120.0
+
+gateway:
+  heartbeat_interval_seconds: 5
+  rollout_server_url: ${POLAR_ROLLOUT_URL}
+  completion_persistence:
+    enabled: true
+    max_field_bytes: 1048576
+    queue_size: 4096
+  nodes:
+    - id: ${POLAR_GATEWAY_NODE_ID}
+      host: ${POLAR_GATEWAY_HOST}
+      port: ${POLAR_GATEWAY_PORT}
+      public_url: ${POLAR_GATEWAY_URL}
+      model_served: ${POLAR_MODEL_SERVED}
+      max_init_workers: ${POLAR_MAX_INIT_WORKERS}
+      max_run_workers: ${POLAR_MAX_RUN_WORKERS}
+      max_postrun_workers: ${POLAR_MAX_POSTRUN_WORKERS}
+      inference:
+        engine: sglang
+        base_url: ${SGLANG_BASE_URL}

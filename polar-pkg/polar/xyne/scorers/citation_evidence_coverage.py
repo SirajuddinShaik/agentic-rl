@@ -1,0 +1,71 @@
+"""Reward final-answer citations that cover dataset-provided evidence."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from polar.xyne.reward_pipeline import XyneScorer, register_scorer
+from polar.xyne.scorers.evidence_common import (
+    citation_chunk_ids,
+    document_id,
+    evidence_coverage,
+    expected_chunk_ids,
+    vector_provider_from_config,
+)
+from polar.xyne.types import XyneRawFlow
+
+NAME = "citation_evidence_coverage"
+
+
+@register_scorer(NAME)
+class CitationEvidenceCoverageScorer(XyneScorer):
+    """Score exact or semantically equivalent citations without penalizing extras."""
+
+    name = NAME
+
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        weight: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
+        cfg = config or {}
+        super().__init__(
+            weight=float(cfg.get("weight", weight)),
+            enabled=bool(cfg.get("enabled", enabled)),
+        )
+        self.gold_chunks = expected_chunk_ids(cfg.get("expected_chunk_ids"))
+        self.gold_documents = {
+            str(value) for value in cfg.get("expected_doc_ids", []) if value
+        }
+        self.exact_weight = float(cfg.get("exact_weight", 0.5))
+        self.vector_provider = vector_provider_from_config(cfg)
+        self.last_metrics: dict[str, float] = {}
+
+    def score(self, flow: XyneRawFlow) -> float:
+        observed = citation_chunk_ids(flow)
+        if self.gold_chunks:
+            score, exact, semantic = evidence_coverage(
+                observed,
+                self.gold_chunks,
+                self.vector_provider,
+                exact_weight=self.exact_weight,
+            )
+            self.last_metrics = {
+                "combined": score,
+                "exact_recall": exact,
+                "semantic_recall": semantic,
+            }
+            return score
+
+        if not self.gold_documents:
+            self.last_metrics = {"document_recall": 0.0}
+            return 0.0
+        cited_documents = {document_id(chunk) for chunk in observed}
+        score = len(cited_documents & self.gold_documents) / len(self.gold_documents)
+        self.last_metrics = {"document_recall": score}
+        return score
+
+
+__all__ = ["CitationEvidenceCoverageScorer"]

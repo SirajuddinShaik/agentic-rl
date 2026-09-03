@@ -1,0 +1,198 @@
+name: xyne-ocr-gpu-sim
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: xyne-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ${REDIS_DATA_DIR:-/opt/monitoring/redis}:/data
+    networks:
+      - xyne_app
+
+  a100-lb:
+    image: haproxy:lts-alpine
+    container_name: xyne-a100-lb
+    restart: unless-stopped
+    volumes:
+      - ./simulation/haproxy-a100.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${A100_LB_PORT:-8100}:8000"
+    networks:
+      - xyne_app
+      - docling_gpu
+    depends_on:
+      - light-ocr-bbox
+      - lighton-ocr-bbox
+
+  light-ocr-bbox:
+    image: python:3.12-slim
+    container_name: light-ocr-bbox
+    restart: unless-stopped
+    environment:
+      NODE_ID: light-ocr-bbox
+      VLLM_MODEL: lightonai/LightOnOCR-2-1B-bbox
+    command: python /app/mock_vllm_bbox.py
+    volumes:
+      - ./simulation/mock_vllm_bbox.py:/app/mock_vllm_bbox.py:ro
+    ports:
+      - "${LIGHT_OCR_BBOX_PORT:-8301}:8000"
+    networks:
+      - xyne_app
+      - docling_gpu
+
+  lighton-ocr-bbox:
+    image: python:3.12-slim
+    container_name: lighton-ocr-bbox
+    restart: unless-stopped
+    environment:
+      NODE_ID: lighton-ocr-bbox
+      VLLM_MODEL: lightonai/LightOnOCR-2-1B-bbox
+    command: python /app/mock_vllm_bbox.py
+    volumes:
+      - ./simulation/mock_vllm_bbox.py:/app/mock_vllm_bbox.py:ro
+    ports:
+      - "${LIGHTON_OCR_BBOX_PORT:-8302}:8000"
+    networks:
+      - xyne_app
+      - docling_gpu
+
+  wrapper-lighton-1:
+    image: python:3.12-slim
+    container_name: xyne-wrapper-lighton-1
+    restart: unless-stopped
+    environment:
+      NODE_ID: xyne-wrapper-lighton-1
+      REDIS_HOST: xyne-redis
+      DOCLING_PROCESS_URL: ${DOCLING_PROCESS_URL:-http://docling-ocr:8000/process}
+      DOCLING_PROCESS_TIMEOUT_SECONDS: ${DOCLING_PROCESS_TIMEOUT_SECONDS:-900}
+      WRAPPER_MAX_INFLIGHT: ${WRAPPER_MAX_INFLIGHT:-4}
+    command: python /app/async_lighton_wrapper.py
+    volumes:
+      - ./simulation/async_lighton_wrapper.py:/app/async_lighton_wrapper.py:ro
+    ports:
+      - "${WRAPPER_LIGHTON_1_PORT:-8201}:8000"
+    networks:
+      - xyne_app
+      - docling_gpu
+    depends_on:
+      - redis
+
+  wrapper-lighton-2:
+    image: python:3.12-slim
+    container_name: xyne-wrapper-lighton-2
+    restart: unless-stopped
+    environment:
+      NODE_ID: xyne-wrapper-lighton-2
+      REDIS_HOST: xyne-redis
+      DOCLING_PROCESS_URL: ${DOCLING_PROCESS_URL:-http://docling-ocr:8000/process}
+      DOCLING_PROCESS_TIMEOUT_SECONDS: ${DOCLING_PROCESS_TIMEOUT_SECONDS:-900}
+      WRAPPER_MAX_INFLIGHT: ${WRAPPER_MAX_INFLIGHT:-4}
+    command: python /app/async_lighton_wrapper.py
+    volumes:
+      - ./simulation/async_lighton_wrapper.py:/app/async_lighton_wrapper.py:ro
+    ports:
+      - "${WRAPPER_LIGHTON_2_PORT:-8202}:8000"
+    networks:
+      - xyne_app
+      - docling_gpu
+    depends_on:
+      - redis
+
+  wrapper-lb:
+    image: haproxy:lts-alpine
+    container_name: xyne-wrapper-lb
+    restart: unless-stopped
+    volumes:
+      - ./simulation/haproxy-wrapper.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${WRAPPER_LB_PORT:-8200}:8000"
+    networks:
+      - xyne_app
+    depends_on:
+      - wrapper-lighton-1
+      - wrapper-lighton-2
+
+  docling-server-lb:
+    image: haproxy:lts-alpine
+    container_name: xyne-docling-server-lb
+    restart: unless-stopped
+    volumes:
+      - ./simulation/haproxy-docling-server.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${DOCLING_SERVER_LB_PORT:-8400}:8000"
+    networks:
+      - xyne_app
+    depends_on:
+      - wrapper-lb
+
+  autoscaler:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: xyne-ocr-autoscaler
+    restart: unless-stopped
+    command: bun scripts/ocrAutoscaler.ts
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:-postgres://xyne:xyne@xyne-db:5432/xyne}
+      DATABASE_HOST: ${DATABASE_HOST:-xyne-db}
+      REDIS_URL: redis://xyne-redis:6379/0
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set}
+      SERVICE_ACCOUNT_ENCRYPTION_KEY: ${SERVICE_ACCOUNT_ENCRYPTION_KEY:?SERVICE_ACCOUNT_ENCRYPTION_KEY must be set}
+      GCP_PROJECT: xyne-sim
+      GCP_ZONE: local-a
+      GCLOUD: /usr/local/bin/sim-gcloud
+      OCR_AUTOSCALER_GCP_ACTUATOR: gcloud
+      OCR_AUTOSCALER_WRAPPER_MIG: xyne-wrapper-lighton-mig
+      OCR_AUTOSCALER_A100_MIG: xyne-a100-local-mig
+      OCR_AUTOSCALER_WRAPPER_BACKEND_SERVICE: xyne-wrapper-lb
+      OCR_AUTOSCALER_WRAPPER_BACKEND_SERVICE_REGION: local
+      OCR_AUTOSCALER_A100_DISCOVERY: static
+      OCR_AUTOSCALER_A100_METRICS_URLS: http://host.docker.internal:${LIGHT_OCR_BBOX_PORT:-8301}/metrics,http://host.docker.internal:${LIGHTON_OCR_BBOX_PORT:-8302}/metrics
+      OCR_AUTOSCALER_WRAPPER_CURRENT_NODES: "2"
+      OCR_AUTOSCALER_A100_CURRENT_NODES: "2"
+      OCR_AUTOSCALER_WRAPPER_MIN_NODES: ${OCR_AUTOSCALER_WRAPPER_MIN_NODES:-0}
+      OCR_AUTOSCALER_WRAPPER_MAX_NODES: ${OCR_AUTOSCALER_WRAPPER_MAX_NODES:-4}
+      OCR_AUTOSCALER_A100_MIN_NODES: ${OCR_AUTOSCALER_A100_MIN_NODES:-0}
+      OCR_AUTOSCALER_A100_MAX_NODES: ${OCR_AUTOSCALER_A100_MAX_NODES:-4}
+      OCR_AUTOSCALER_DRY_RUN: ${OCR_AUTOSCALER_DRY_RUN:-false}
+      OCR_AUTOSCALER_WRITE_RUNTIME_CONFIG: ${OCR_AUTOSCALER_WRITE_RUNTIME_CONFIG:-true}
+      OCR_AUTOSCALER_RESIZE_MIGS: "false"
+      OCR_AUTOSCALER_METRICS_ENABLED: "true"
+      OCR_AUTOSCALER_METRICS_PORT: "3021"
+      OCR_COST_CONFIG_PATH: /etc/xyne/ocr-costs.json
+      OCR_AUTOSCALER_INTERVAL_MS: ${OCR_AUTOSCALER_INTERVAL_MS:-15000}
+      OCR_AUTOSCALER_SIM_DEMAND_PAGES: ${OCR_AUTOSCALER_SIM_DEMAND_PAGES:-0,125,500,9000,0}
+      OCR_AUTOSCALER_WRAPPER_PAGES_PER_NODE: ${OCR_AUTOSCALER_WRAPPER_PAGES_PER_NODE:-4000}
+      OCR_AUTOSCALER_A100_PAGES_PER_NODE: ${OCR_AUTOSCALER_A100_PAGES_PER_NODE:-125}
+      OCR_AUTOSCALER_SUBMIT_PERMITS_PER_WRAPPER: ${OCR_AUTOSCALER_SUBMIT_PERMITS_PER_WRAPPER:-64}
+      OCR_AUTOSCALER_SUBMITTER_CONTAINER_COUNT: ${OCR_AUTOSCALER_SUBMITTER_CONTAINER_COUNT:-1}
+      SUBMITTER_CONTAINER_MIN: "1"
+      OCR_AUTOSCALER_SUBMITTER_FIXED_CONCURRENCY: ${OCR_AUTOSCALER_SUBMITTER_FIXED_CONCURRENCY:-16}
+      OCR_AUTOSCALER_SUBMITTER_PAGE_CHUNK_SIZE: ${OCR_AUTOSCALER_SUBMITTER_PAGE_CHUNK_SIZE:-1}
+      OCR_AUTOSCALER_SUBMITTER_PAGES_PER_SECOND_PER_CONTAINER: ${OCR_AUTOSCALER_SUBMITTER_PAGES_PER_SECOND_PER_CONTAINER:-24}
+      OCR_AUTOSCALER_SUBMITTER_TARGET_FILL_SECONDS: ${OCR_AUTOSCALER_SUBMITTER_TARGET_FILL_SECONDS:-30}
+    volumes:
+      - ./simulation/sim-gcloud.sh:/usr/local/bin/sim-gcloud:ro
+      - ./ocr-costs.json:/etc/xyne/ocr-costs.json:ro
+    ports:
+      - "${OCR_AUTOSCALER_METRICS_PORT:-3021}:3021"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - xyne_app
+      - docling_gpu
+    depends_on:
+      - redis
+      - wrapper-lb
+      - a100-lb
+
+networks:
+  xyne_app:
+    external: true
+    name: ${XYNE_DOCKER_NETWORK:-deployment_xyne}
+  docling_gpu:
+    external: true
+    name: ${DOCLING_DOCKER_NETWORK:-docling-server_default}

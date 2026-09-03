@@ -1,0 +1,1070 @@
+diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
+index 04c838e..ef967a7 100644
+--- a/miles/backends/megatron_utils/actor.py
++++ b/miles/backends/megatron_utils/actor.py
+@@ -59,9 +59,13 @@ from .parallel import verify_megatron_parallel_state
+ from .replay_utils import register_replay_list_moe
+ from .update_weight.common import named_params_and_buffers
+ from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
+-from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+ 
++
++def _import_update_weight_p2p():
++    from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
++    return UpdateWeightP2P
++
+ if TYPE_CHECKING:
+     from miles.ray.rollout.rollout_manager import EnginesAndLock
+ 
+@@ -261,7 +265,7 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+                 update_weight_cls = UpdateWeightFromDiskDelta
+             else:
+-                update_weight_cls = UpdateWeightP2P
++                update_weight_cls = _import_update_weight_p2p()
+         self.weight_updater = update_weight_cls(
+             self.args,
+             self.model,
+diff --git a/miles/backends/megatron_utils/checkpoint.py b/miles/backends/megatron_utils/checkpoint.py
+index 4063619..edd3931 100644
+--- a/miles/backends/megatron_utils/checkpoint.py
++++ b/miles/backends/megatron_utils/checkpoint.py
+@@ -119,6 +119,39 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
+             checkpointing_context=checkpointing_context,
+             skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+         )
++    elif _is_adapter_rollout_checkpoint(load_path):
++        # --load points at a resume checkpoint carrying only the LoRA adapter +
++        # rollout/dataset state (base weights are NOT in it). Load the base from
++        # --ref-load (the same Megatron checkpoint batch-0 loaded from); the adapter
++        # itself is restored separately via --lora-adapter-path. Iteration 0 so the
++        # actor resumes at loaded_rollout_id+1 = rollout id 1.
++        base_path = getattr(args, "ref_load", None) or args.hf_checkpoint
++        old_load, old_no_lo, old_no_lr, old_ft = (
++            args.load,
++            args.no_load_optim,
++            args.no_load_rng,
++            args.finetune,
++        )
++        args.load = base_path
++        args.no_load_optim = True
++        args.no_load_rng = True
++        args.finetune = True
++        try:
++            _load_checkpoint_megatron(
++                ddp_model=ddp_model,
++                optimizer=optimizer,
++                opt_param_scheduler=opt_param_scheduler,
++                checkpointing_context=checkpointing_context,
++                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
++            )
++        finally:
++            args.load, args.no_load_optim, args.no_load_rng, args.finetune = (
++                old_load,
++                old_no_lo,
++                old_no_lr,
++                old_ft,
++            )
++        result = (0, 0)
+     else:
+         result = _load_checkpoint_hf(
+             ddp_model=ddp_model,
+@@ -176,6 +209,22 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
+     )
+ 
+ 
++def _is_adapter_rollout_checkpoint(path: str | Path) -> bool:
++    """True when --load points at a LoRA resume checkpoint (a top-level ``rollout/``
++    dataset-state dir and/or ``iter_*`` dirs holding an ``adapter/`` subdir) rather
++    than a base-model checkpoint. Base weights come from --hf-checkpoint via the
++    bridge, so the base-load step must be skipped for these (see load_checkpoint)."""
++    p = Path(path)
++    if not p.is_dir():
++        return False
++    if (p / "rollout").is_dir():
++        return True
++    return any(
++        x.is_dir() and re.fullmatch(r"iter_\d{7}", x.name) and (x / "adapter").is_dir()
++        for x in p.iterdir()
++    )
++
++
+ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
+     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
+     from megatron.bridge import AutoBridge
+diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py
+index bbeea97..b5f7990 100644
+--- a/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py
++++ b/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/mixin.py
+@@ -308,9 +308,14 @@ class DistBucketedWeightUpdateMixin:
+ 
+     def _pause_and_prepare_engines(self) -> None:
+         """Pause rollout engines, flush cache, and open the weight-update session."""
++        from miles.backends.megatron_utils.update_weight.polar_inference_gate import pause_polar_inference
++
+         self._weight_update_selector = weight_update_selector(self.args)
+         if dist.get_rank() == 0:
++            # Stop Polar from racing LoRA unload/reload (KeyError / hung chat).
++            pause_polar_inference()
+             mode = self.args.pause_generation_mode
++            ray.get([engine.abort_request.remote(abort_all=True) for engine in self.rollout_engines])
+             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
+             if mode != "in_place":
+                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+@@ -319,16 +324,45 @@ class DistBucketedWeightUpdateMixin:
+ 
+     def _finalize_and_resume_engines(self) -> None:
+         """Close the weight-update session and resume rollout engines."""
+-        if dist.get_rank() == 0:
+-            # unify update weight version here to cover both full param and lora update
+-            ray.get(
+-                [
+-                    engine.update_weight_version.remote(weight_version=str(self.weight_version))
+-                    for engine in self.rollout_engines
+-                ]
+-            )
+-            end_weight_update(self.rollout_engines)
+-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++        from miles.backends.megatron_utils.update_weight.polar_inference_gate import resume_polar_inference
++
++        try:
++            if dist.get_rank() == 0:
++                # unify update weight version here to cover both full param and lora update
++                ray.get(
++                    [
++                        engine.update_weight_version.remote(weight_version=str(self.weight_version))
++                        for engine in self.rollout_engines
++                    ]
++                )
++                end_weight_update(self.rollout_engines)
++                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++                # Prove engines can generate before Polar floods chat again.
++                # Do NOT abort_all here: it races in-flight generate waiters (rid_to_state KeyError → 500).
++                try:
++                    ray.get(
++                        [engine.health_generate.remote(timeout=30.0) for engine in self.rollout_engines],
++                        timeout=60.0,
++                    )
++                except Exception as exc:
++                    logger.warning(
++                        "post-sync health_generate failed (%s); abort+continue once more before Polar resume",
++                        exc,
++                    )
++                    ray.get([engine.abort_request.remote(abort_all=True) for engine in self.rollout_engines])
++                    ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++                    try:
++                        ray.get(
++                            [engine.health_generate.remote(timeout=30.0) for engine in self.rollout_engines],
++                            timeout=60.0,
++                        )
++                    except Exception as exc2:
++                        logger.warning("post-sync health_generate still failing after abort: %s", exc2)
++        finally:
++            # Always clear Polar pause — even if health_generate / continue fails —
++            # otherwise rollouts stay paused and RTX2 sits at util≈0 forever.
++            if dist.get_rank() == 0:
++                resume_polar_inference()
+ 
+     def pop_metrics(self) -> dict[str, float]:
+         """Return and clear ``update_weight_metrics``. Drained by the actor onto the step log;
+diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+index 43373c4..d58585a 100644
+--- a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
++++ b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+@@ -253,7 +253,11 @@ class UpdateWeightFromTensor:
+         )
+ 
+         if rank == 0:
++            from .polar_inference_gate import pause_polar_inference
++
++            pause_polar_inference()
+             mode = self.args.pause_generation_mode
++            ray.get([engine.abort_request.remote(abort_all=True) for engine in self.rollout_engines])
+             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
+             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+             if not skip_base_sync:
+@@ -314,10 +318,37 @@ class UpdateWeightFromTensor:
+         dist.barrier(group=get_gloo_group())
+ 
+         if rank == 0:
+-            # Skip when no fresh base bytes landed (skip_base_sync).
+-            if not skip_base_sync:
+-                end_weight_update(self.rollout_engines)
+-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++            from .polar_inference_gate import resume_polar_inference
++
++            try:
++                # Skip when no fresh base bytes landed (skip_base_sync).
++                if not skip_base_sync:
++                    end_weight_update(self.rollout_engines)
++                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++                # Prove engines can generate before Polar floods chat again.
++                # Do NOT abort_all here: it races in-flight generate waiters (rid_to_state KeyError → 500).
++                try:
++                    ray.get(
++                        [engine.health_generate.remote(timeout=30.0) for engine in self.rollout_engines],
++                        timeout=60.0,
++                    )
++                except Exception as exc:
++                    logger.warning(
++                        "post-sync health_generate failed (%s); abort+continue once more before Polar resume",
++                        exc,
++                    )
++                    ray.get([engine.abort_request.remote(abort_all=True) for engine in self.rollout_engines])
++                    ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
++                    try:
++                        ray.get(
++                            [engine.health_generate.remote(timeout=30.0) for engine in self.rollout_engines],
++                            timeout=60.0,
++                        )
++                    except Exception as exc2:
++                        logger.warning("post-sync health_generate still failing after abort: %s", exc2)
++            finally:
++                # Always clear Polar pause so rollouts cannot stick at util≈0.
++                resume_polar_inference()
+         dist.barrier(group=get_gloo_group())
+ 
+     def _mm_tower_named_tensors(self) -> list[tuple[str, torch.Tensor]] | None:
+diff --git a/miles/backends/sglang_utils/sglang_engine.py b/miles/backends/sglang_utils/sglang_engine.py
+index 77e95bf..08dad32 100644
+--- a/miles/backends/sglang_utils/sglang_engine.py
++++ b/miles/backends/sglang_utils/sglang_engine.py
+@@ -442,6 +442,32 @@ class SGLangEngine(RayActor):
+             payload,
+         )
+ 
++    def abort_request(self, abort_all: bool = True):
++        """Abort in-flight / waiting requests so LoRA unload and flush can proceed."""
++        if self.node_rank != 0:
++            return
++        try:
++            response = requests.post(
++                f"http://{self.server_host}:{self.server_port}/abort_request",
++                json={"abort_all": abort_all},
++                timeout=30,
++            )
++            if response.status_code >= 400:
++                logger.warning(
++                    "abort_request failed for %s:%s status=%s body=%s",
++                    self.server_host,
++                    self.server_port,
++                    response.status_code,
++                    response.text[:200],
++                )
++        except Exception as e:
++            logger.warning(
++                "abort_request error for %s:%s: %s",
++                self.server_host,
++                self.server_port,
++                e,
++            )
++
+     def flush_cache(self):
+         """Flush the cache of the server."""
+         if self.node_rank != 0:
+diff --git a/miles/backends/training_utils/log_utils.py b/miles/backends/training_utils/log_utils.py
+index db15d89..81aa486 100644
+--- a/miles/backends/training_utils/log_utils.py
++++ b/miles/backends/training_utils/log_utils.py
+@@ -209,15 +209,63 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
+                 "step_adapter_names",
+                 "step_adapter_batch_sizes",
+                 "prompt_group_sizes",
++                "action_masks",
+             ]:
+                 continue
+             if isinstance(val, (list, tuple)):
+                 if isinstance(val[0], torch.Tensor):
+                     count = len(val)
++                    # Indexer/keys whose per-sample tensors are CP-sliced RESPONSE-token
++                    # vectors. Under CP>1 a sample whose response tokens fall entirely on
++                    # another rank (or a multi-turn sample with an empty local turn) can
++                    # legitimately produce an EMPTY (0-element) 1-D tensor for this rank;
++                    # skip those samples when aggregating so `torch.cat` does not see a
++                    # shape mismatch. A 0-dim scalar sample (e.g. a ragged codec decoding
++                    # a single-token response to a scalar) is degraded to a 0-element
++                    # vector too, instead of crashing the whole Ray actor.
++                    _cat_ok = []
++                    _dropped = 0
++                    for _i, _v in enumerate(val):
++                        if not isinstance(_v, torch.Tensor):
++                            _dropped += 1
++                            continue
++                        if _v.dim() == 0:
++                            logger.warning(
++                                "log_rollout_data: key=%s sample=%d is 0-dim scalar (shape=%s); "
++                                "degrading to empty, dropping from aggregation",
++                                key,
++                                _i,
++                                tuple(_v.shape),
++                            )
++                            _dropped += 1
++                            continue
++                        if _v.numel() == 0:
++                            # Empty 1-D tensor (CP-empty rank slice): drop, it contributes 0.
++                            _dropped += 1
++                            continue
++                        _cat_ok.append(_v)
++                    if not _cat_ok:
++                        # All samples degenerate on this rank/step (e.g. an async
++                        # weight-sync placeholder batch where every response_length==0).
++                        # NEVER skip unconditionally: reduce_gathered_log_dict uses the
++                        # first gathered rank's keys as the expected set, so if ANY rank
++                        # omits a key another rank kept we get KeyError across ranks.
++                        # Emit a neutral 0-contribution (sum, count)=(0.0, 0) instead,
++                        # which reduces to 0.0 and is exactly what an all-empty batch
++                        # should contribute.
++                        logger.warning(
++                            "log_rollout_data: key=%s has no non-empty per-sample tensors "
++                            "(len=%d, dropped=%d); emitting (0.0, 0) to keep cross-rank keys aligned",
++                            key,
++                            len(val),
++                            _dropped,
++                        )
++                        log_dict[key] = (0.0, 0)
++                        continue
+                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
+                     # modified in place and will cause problem for the next rollout.
+-                    tensor = torch.cat(val).clone().detach()
+-                    if tensor.device != loss_masks[0].device:
++                    tensor = torch.cat(_cat_ok).clone().detach()
++                    if loss_masks and tensor.device != loss_masks[0].device:
+                         tensor = tensor.to(loss_masks[0].device)
+                     if key in [
+                         "log_probs",
+@@ -230,15 +278,18 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
+                         "opd_reverse_kl",
+                         "entropy",
+                     ]:
+-                        sum_of_sample_mean = get_sum_of_sample_mean(
+-                            total_lengths,
+-                            response_lengths,
+-                            loss_masks,
+-                            qkv_format=args.qkv_format,
+-                            max_seq_lens=max_seq_lens,
+-                            denominators=rollout_data.get("rollout_mask_sums", None),
+-                        )
+-                        per_rank_sum = cp_size * sum_of_sample_mean(tensor)
++                        if loss_masks:
++                            sum_of_sample_mean = get_sum_of_sample_mean(
++                                total_lengths,
++                                response_lengths,
++                                loss_masks,
++                                qkv_format=args.qkv_format,
++                                max_seq_lens=max_seq_lens,
++                                denominators=rollout_data.get("rollout_mask_sums", None),
++                            )
++                            per_rank_sum = cp_size * sum_of_sample_mean(tensor)
++                        else:
++                            per_rank_sum = tensor.mean() * cp_size * count
+                         if rollout_count_share is not None:
+                             count = rollout_count_share
+                     else:
+diff --git a/miles/backends/training_utils/loss_hub/advantages.py b/miles/backends/training_utils/loss_hub/advantages.py
+index 1f4bd77..dc61e70 100644
+--- a/miles/backends/training_utils/loss_hub/advantages.py
++++ b/miles/backends/training_utils/loss_hub/advantages.py
+@@ -116,8 +116,10 @@ def normalize_advantages(
+     """Whiten advantages across the DP group using `loss_masks` for weighting.
+ 
+     Under CP > 1 the mask is sliced to this rank's tokens; when the local
+-    mask is empty the inputs pass through unchanged. Output shapes match
+-    `advantages`.
++    mask is empty the inputs pass through unchanged. When masks exist but
++    the DP-group mask sum is zero (e.g. Polar remove_sample placeholders),
++    whitening is skipped and advantages are returned unchanged. Output
++    shapes match `advantages`.
+     """
+     num_samples = len(advantages)
+     assert len(loss_masks) == num_samples
+diff --git a/miles/backends/training_utils/loss_hub/math_utils.py b/miles/backends/training_utils/loss_hub/math_utils.py
+index 7b40b6b..7f33b4e 100644
+--- a/miles/backends/training_utils/loss_hub/math_utils.py
++++ b/miles/backends/training_utils/loss_hub/math_utils.py
+@@ -1075,7 +1075,7 @@ def _calculate_log_probs_and_entropy_true_on_policy(
+     _maybe_dump_top_logprob_backward("full_logits", full_logits)
+     log_probs_full = torch.log_softmax(full_logits, dim=-1)
+     _maybe_dump_top_logprob_backward("log_probs_full", log_probs_full)
+-    log_prob = torch.gather(log_probs_full, dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
++    log_prob = torch.gather(log_probs_full, dim=-1, index=tokens.unsqueeze(-1))  # keep [R, 1]: callers squeeze(-1)
+     _maybe_dump_top_logprob_backward("log_prob", log_prob)
+ 
+     entropy = None
+diff --git a/miles/ray/placement_group.py b/miles/ray/placement_group.py
+index f125a65..8d44257 100644
+--- a/miles/ray/placement_group.py
++++ b/miles/ray/placement_group.py
+@@ -1,4 +1,5 @@
+ import copy
++import os
+ import logging
+ import socket
+ 
+@@ -185,8 +186,17 @@ async def create_training_models(args, pgs, rollout_manager):
+ 
+ 
+ def create_rollout_manager(args, pg):
++    _actor_env_vars = {}
++    for _k in ("MILES_POLAR_TRAJECTORY_DUMP_DIR", "MILES_POLAR_MAX_TRACES_PER_SESSION"):
++        _v = os.environ.get(_k)
++        if _v:
++            _actor_env_vars[_k] = _v
++    _actor_runtime_env = {"env_vars": _actor_env_vars} if _actor_env_vars else None
+     rollout_manager = RolloutManager.options(
+-        num_cpus=1, num_gpus=0, **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {})
++        num_cpus=1,
++        num_gpus=0,
++        runtime_env=_actor_runtime_env,
++        **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {}),
+     ).remote(args, pg)
+ 
+     # calculate num_rollout from num_epoch
+diff --git a/miles/ray/rollout/rollout_manager.py b/miles/ray/rollout/rollout_manager.py
+index 6973981..15e57fb 100644
+--- a/miles/ray/rollout/rollout_manager.py
++++ b/miles/ray/rollout/rollout_manager.py
+@@ -161,6 +161,96 @@ class RolloutManager:
+             data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config)
+         return dict(sample_indices=sample_indices, data_ref=data_ref)
+ 
++    def _microbatch_generator(self, rollout_id):
++        """Blocking generator yielding ONE completed prompt group's raw samples.
++
++        Wraps ``miles.rollout.polar_rollout.generate_rollout_polar_async_microbatch``
++        (the streaming equivalent of ``generate_rollout_polar_async``) but yields
++        each completed group (``n_samples_per_prompt`` samples) as soon as the
++        Polar async worker drains it, instead of blocking for the full
++        ``rollout_batch_size`` batch. The trainer then ACCUMULATES groups and
++        converts/trains once a full global-batch (``GLOBAL_BATCH_SIZE`` samples,
++        i.e. ``GLOBAL_BATCH_SIZE // n_samples_per_prompt`` groups) is available --
++        so the optimizer-step topology (batch size and steps per rollout) stays
++        identical to the non-streamed path.
++
++        Runs on the calling thread (the worker does its own blocking collection);
++        driven via ``asyncio.to_thread`` so it never blocks the Ray event loop.
++        """
++        # Use the configured rollout function (can be the polar microbatch
++        # wrapper or a custom direct driver like xyne_direct_driver).
++        from miles.rollout import polar_rollout
++        microbatch_gen = polar_rollout.generate_rollout_polar_async_microbatch
++        for fn_output in microbatch_gen(
++            self.args, rollout_id, self.data_source, evaluation=False
++        ):
++            # samples = [group] (one group per yield); extract the group itself
++            group = fn_output.samples if isinstance(fn_output.samples, list) else [fn_output.samples]
++            yield list(group[0])  # one prompt group = list[Sample]
++
++    def convert_batch(self, batches):
++        """Run the post-process / convert / split pipeline on accumulated groups.
++
++        ``batches`` is a list of yielded raw groups (each ``list[Sample]``). The
++        number of groups must form whole ``global_batch_size`` units, so this is
++        called only at a train boundary. Mirrors :meth:`generate`'s conversion.
++        """
++        data = [s for g in batches for s in g]  # flatten groups -> list[Sample]
++        data, metadata = postprocess_rollout_data(
++            self.args, data, train_parallel_config=self.train_parallel_config
++        )
++        data = convert_samples_to_train_data(
++            self.args,
++            data,
++            metadata=metadata,
++            custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
++            custom_reward_post_process_func=self.custom_reward_post_process_func,
++        )
++        sample_indices = data.get("sample_indices")
++        if self.args.delay_split_train_data_by_dp:
++            data_ref = object_store.get_instance().put(
++                value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC
++            )
++        else:
++            data_ref = split_train_data_by_dp(self.args, data, self.train_parallel_config)
++        return dict(sample_indices=sample_indices, data_ref=data_ref)
++
++    def micro_batch_size_in_groups(self):
++        """How many prompt groups make up one global-batch optimizer step."""
++        gbs = self.args.global_batch_size
++        spp = getattr(self.args, "n_samples_per_prompt", 8)
++        return max(1, gbs // spp) if spp else 1
++
++    def start_microbatch_generation(self, rollout_id):
++        """Seed the on-actor micro-batch generator for ``rollout_id``.
++
++        Ray actors cannot stream async generators back to the driver, so this
++        returns immediately and the driver advances the stream one group at a
++        time via :meth:`next_microbatch` (a plain remote call). The actual Polar
++        streaming generator runs inside this actor process.
++        """
++        self._microbatch_iter = self._microbatch_generator(rollout_id)
++        self._microbatch_rollout_id = rollout_id
++        return True
++
++    def next_microbatch(self):
++        """Return the next completed prompt group, or ``None`` when exhausted.
++
++        Blocking: waits until the Polar async worker drains the next group
++        (``n_samples_per_prompt`` samples). Returns ``(False, None)`` once the
++        rollout's groups are all consumed.
++        """
++        if self._microbatch_iter is None:
++            return (False, None)
++        try:
++            group = next(self._microbatch_iter)
++            return (True, group)
++        except StopIteration:
++            self._microbatch_iter = None
++            return (False, None)
++
++
++
+     async def eval(
+         self,
+         rollout_id,
+diff --git a/miles/ray/rollout/train_data_conversion.py b/miles/ray/rollout/train_data_conversion.py
+index 81c2986..ec2c988 100644
+--- a/miles/ray/rollout/train_data_conversion.py
++++ b/miles/ray/rollout/train_data_conversion.py
+@@ -109,12 +109,38 @@ def convert_samples_to_train_data(
+     if samples[0].metadata and "round_number" in samples[0].metadata:
+         train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
+ 
+-    # Add rollout log probabilities for off-policy correction
+-    if samples[0].rollout_log_probs is not None:
+-        train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
++    # Add rollout log probabilities for off-policy correction.
++    # ALWAYS populate the key (even if every sample has rollout_log_probs=None):
++    # downstream log_utils.reduce_gathered_log_dict uses the first rank's keys as
++    # the expected set and gathers that key across ranks; if ANY rank omits the key
++    # we get KeyError('rollout_log_probs'). Defaulting to zeros per response_length
++    # keeps all ranks consistent.
++    if True:
++        rollout_log_probs = []
++        for sample in samples:
++            if sample.rollout_log_probs is None:
++                sample.rollout_log_probs = [0.0] * sample.response_length
++            # response_length==0 samples (async padding / weight-sync placeholders)
++            # would CP-slice to 0-element tensors on EVERY trainer rank; log_utils
++            # drops all-empty keys and reduce_gathered_log_dict then raises
++            # KeyError across ranks. Emit a single 0.0 so slices are non-empty;
++            # loss_mask is all-zero for these samples, so the metric contribution is 0.
++            rollout_log_probs.append(
++                sample.rollout_log_probs if sample.rollout_log_probs else [0.0]
++            )
++        train_data["rollout_log_probs"] = rollout_log_probs
+ 
+     if samples[0].action_mask is not None:
+-        train_data["action_masks"] = [sample.action_mask for sample in samples]
++        # Guard every sample: a recycled/retried prompt group (async_unused_samples_handler
++        # == "retry") resets action_mask to None via reset_for_retry(). Default any None
++        # to an all-zeros mask of the response length, mirroring loss_mask handling above,
++        # so a None in a non-first sample cannot slip through to data.py's tensor conversion.
++        action_masks = []
++        for sample in samples:
++            if sample.action_mask is None:
++                sample.action_mask = [0] * sample.response_length
++            action_masks.append(sample.action_mask)
++        train_data["action_masks"] = action_masks
+ 
+     if samples[0].rollout_routed_experts is not None:
+         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+diff --git a/miles/ray/train/actor_factory.py b/miles/ray/train/actor_factory.py
+index 7e17066..5a38994 100644
+--- a/miles/ray/train/actor_factory.py
++++ b/miles/ray/train/actor_factory.py
+@@ -34,6 +34,11 @@ def allocate_gpus_for_actor(
+         ),
+         # DeepEP/NVSHMEM's internal NCCL conflicts with our NCCL and hangs under CUDA graphs.
+         "NVSHMEM_DISABLE_NCCL": os.environ.get("NVSHMEM_DISABLE_NCCL", "1"),
++        # MoE alltoall + CP P2P on Blackwell: avoid record-stream traps and fail mid-train
++        # NCCL busy-waits instead of wedging the Ray job as "RUNNING" forever (State B).
++        "TORCH_NCCL_AVOID_RECORD_STREAMS": os.environ.get("TORCH_NCCL_AVOID_RECORD_STREAMS", "1"),
++        "TORCH_NCCL_ASYNC_ERROR_HANDLING": os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
++        "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "600"),
+         **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
+         **args.train_env_vars,
+     }
+diff --git a/miles/rollout/__init__.py b/miles/rollout/__init__.py
+index e69de29..da017df 100644
+--- a/miles/rollout/__init__.py
++++ b/miles/rollout/__init__.py
+@@ -0,0 +1,74 @@
++"""Miles rollout integrations for Polar-managed agent sessions.
++
++This package wires the Polar rollout server into Miles' training loop. The
++public surface re-exports the canonical entrypoints from the sibling modules so
++a trainer (or the example launch scripts) can import them directly from
++``miles.rollout`` without reaching into module internals:
++
++- :mod:`.polar_config` — resolve Miles args into a :class:`PolarSlimeConfig`
++  and render Polar task/topology payloads.
++- :mod:`.polar_rollout` — the async rollout entrypoint
++  ``generate_rollout_polar_async`` driven by ``--rollout-function-path``.
++- :mod:`.polar_adapter` — convert Polar session results into Miles ``Sample``s.
++- :mod:`.polar_reward` — the ``--custom-rm-path`` async entrypoint
++  ``custom_rm`` and the leave-one-trajectory-out reward post-processor.
++- :mod:`.polar_data_source` — ``CeilEpochRolloutDataSourceWithBuffer``, which
++  rounds epoch length up to a whole number of rollout batches.
++
++Polar core is an optional, runtime-only dependency; importing this package does
++not require ``polar`` to be installed.
++"""
++
++from __future__ import annotations
++
++# Public surface is resolved lazily via module ``__getattr__`` so ``import
++# miles.rollout`` does not eagerly pull the heavy sibling chains (notably
++# ``polar_data_source`` -> ``miles.rollout.data_source`` -> ``sglang``). This
++# keeps the package importable under a plain Miles environment that has the
++# thin polar bridge deps but not the full training stack.
++
++_EXPORTS = {
++    # polar_config
++    "PolarSlimeConfig": (".polar_config", "PolarSlimeConfig"),
++    "resolve_polar_slime_config": (".polar_config", "resolve_polar_slime_config"),
++    "resolve_sglang_router_base_url": (".polar_config", "resolve_sglang_router_base_url"),
++    "render_task_payload": (".polar_config", "render_task_payload"),
++    "render_instruction": (".polar_config", "render_instruction"),
++    "render_topology_template": (".polar_config", "render_topology_template"),
++    # polar_rollout
++    "generate_rollout_polar_async": (".polar_rollout", "generate_rollout_polar_async"),
++    "AsyncPolarRolloutWorker": (".polar_rollout", "AsyncPolarRolloutWorker"),
++    "get_global_async_worker": (".polar_rollout", "get_global_async_worker"),
++    "stop_global_worker": (".polar_rollout", "stop_global_worker"),
++    "PolarRolloutSchedulerError": (".polar_rollout", "PolarRolloutSchedulerError"),
++    "PolarLowCompleteAcceptFractionError": (".polar_rollout", "PolarLowCompleteAcceptFractionError"),
++    # polar_adapter
++    "session_result_to_samples": (".polar_adapter", "session_result_to_samples"),
++    "RolloutLogprobError": (".polar_adapter", "RolloutLogprobError"),
++    # polar_reward
++    "custom_rm": (".polar_reward", "custom_rm"),
++    "compute_reward": (".polar_reward", "compute_reward"),
++    "reward_func": (".polar_reward", "reward_func"),
++    "post_process_rewards": (".polar_reward", "post_process_rewards"),
++    # polar_data_source
++    "CeilEpochRolloutDataSourceWithBuffer": (".polar_data_source", "CeilEpochRolloutDataSourceWithBuffer"),
++    "ceil_to_batch_size": (".polar_data_source", "ceil_to_batch_size"),
++}
++
++__all__ = list(_EXPORTS)
++
++
++def __getattr__(name: str) -> object:
++    target = _EXPORTS.get(name)
++    if target is None:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    module_name, attr = target
++    from importlib import import_module
++
++    value = getattr(import_module(module_name, __name__), attr)
++    globals()[name] = value
++    return value
++
++
++def __dir__() -> list[str]:
++    return sorted(__all__)
+diff --git a/miles/rollout/polar_adapter.py b/miles/rollout/polar_adapter.py
+index d0e22cc..e5f5ff1 100644
+--- a/miles/rollout/polar_adapter.py
++++ b/miles/rollout/polar_adapter.py
+@@ -56,6 +56,7 @@ def session_result_to_samples(
+     trajectory_index: int,
+     reward_key: str = "score",
+     max_tokens: int | None = None,
++    source_metadata: dict | None = None,
+ ) -> list[Any]:
+     """Convert one Polar session result into Miles samples — one per trace.
+ 
+@@ -91,6 +92,7 @@ def session_result_to_samples(
+             index=trajectory_index,
+             reward_key=reward_key,
+             max_tokens=max_tokens,
++            source_metadata=source_metadata,
+         )
+         if sample is not None:
+             samples.append(sample)
+@@ -122,11 +124,12 @@ def _build_sample(
+     reward_key: str,
+     max_tokens: int | None = None,
+     tokenizer: Any | None = None,
++    source_metadata: dict | None = None,
+ ) -> Any | None:
+     prompt_ids = list(trace.prompt_ids)
+     response_ids = list(trace.response_ids)
+ 
+-    if not prompt_ids or not response_ids:
++    if not prompt_ids and not response_ids:
+         logger.warning(
+             "Dropping trace %d from session %s: missing tokens (prompt=%d, response=%d)",
+             trace_index, result.session_id, len(prompt_ids), len(response_ids),
+@@ -211,7 +214,7 @@ def _build_sample(
+         action_mask=action_mask,
+         rollout_log_probs=response_log_probs,
+         status=status,
+-        metadata={"polar": polar_metadata},
++        metadata={"polar": polar_metadata, **(source_metadata or {})},
+     )
+ 
+ 
+@@ -222,6 +225,7 @@ def _build_dummy_sample(
+     group_index: int,
+     index: int,
+     reward_key: str,
++    source_metadata: dict | None = None,
+ ) -> Any:
+     """Fully masked placeholder for a session with no usable trace.
+ 
+@@ -254,10 +258,11 @@ def _build_dummy_sample(
+         rollout_id=index,
+         reward={reward_key: 0.0},
+         loss_mask=[0],
++        action_mask=[0],
+         rollout_log_probs=[0.0],
+         status=Sample.Status.ABORTED,
+-        remove_sample=True,
+-        metadata={"polar": polar_metadata},
++        remove_sample=False,
++        metadata={"polar": polar_metadata, **(source_metadata or {})},
+     )
+ 
+ 
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index 9ab4ef8..886f617 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -1717,6 +1717,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                 default=0.0,
+                 help="LoRA dropout rate (default: 0.0)",
+             )
++            parser.add_argument(
++                "--lora-a-init-method",
++                dest="lora_A_init_method",
++                type=str,
++                default="xavier",
++                choices=["xavier", "uniform", "normal", "kaiming", "zero"],
++                help="Initialization method for LoRA matrix A (default: xavier)",
++            )
++            parser.add_argument(
++                "--lora-b-init-method",
++                dest="lora_B_init_method",
++                type=str,
++                default="zero",
++                choices=["xavier", "uniform", "normal", "kaiming", "zero"],
++                help="Initialization method for LoRA matrix B (default: zero; set xavier etc for non-zero)",
++            )
+             parser.add_argument(
+                 "--lora-type",
+                 type=str,
+@@ -2822,6 +2838,27 @@ def _validate_rematerialize_param_from_master_weight(args):
+         args.check_rematerialize_param_from_master_weight = True
+ 
+ 
++def _is_adapter_rollout_checkpoint(load: str | None) -> bool:
++    """True when --load points at a LoRA resume checkpoint (a top-level
++    ``rollout/`` dataset-state dir and/or ``iter_*`` dirs with an ``adapter/``
++    subdir) rather than a base-model checkpoint. Base weights come from
++    --hf-checkpoint via the bridge, so such a dir is a valid --load that must
++    not be treated as a fresh (no-checkpoint) run."""
++    if not load or not os.path.isdir(load):
++        return False
++    if os.path.isdir(os.path.join(load, "rollout")):
++        return True
++    try:
++        names = os.listdir(load)
++    except OSError:
++        return False
++    for name in names:
++        if len(name) == 11 and name.startswith("iter_") and name[5:].isdigit():
++            if os.path.isdir(os.path.join(load, name, "adapter")):
++                return True
++    return False
++
++
+ def miles_validate_args(args):
+     validate_dashboard_args(args)
+ 
+@@ -3003,14 +3040,20 @@ def miles_validate_args(args):
+     if args.megatron_to_hf_mode == "bridge":
+         # Fresh runs pass a not-yet-created `--load` dir; fall back to the reference
+         # weights (loaded via the HF bridge) instead of asserting in load_checkpoint.
+-        # Mirrors the non-bridge branch below.
++        # Mirrors the non-bridge branch below. A resume run passes --load at the old
++        # save dir (LoRA adapter + rollout/dataset state); preserve it so the rollout
++        # data source and adapter can be restored, and leave start_rollout_id for the
++        # actor to derive from the loaded checkpoint (loaded_rollout_id + 1).
+         if (
+             args.load is None
+             or not os.path.exists(args.load)
+-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
++            or (
++                not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
++                and not _is_adapter_rollout_checkpoint(args.load)
++            )
+         ):
+             args.load = args.ref_load or args.hf_checkpoint
+-        args.start_rollout_id = 0
++            args.start_rollout_id = 0
+     else:
+         if (
+             args.load is None
+diff --git a/miles/utils/distributed_utils.py b/miles/utils/distributed_utils.py
+index 22b7f6b..ff9ba59 100644
+--- a/miles/utils/distributed_utils.py
++++ b/miles/utils/distributed_utils.py
+@@ -1,3 +1,4 @@
++import logging
+ from datetime import timedelta
+ from typing import Any
+ 
+@@ -16,6 +17,8 @@ from torch.distributed.distributed_c10d import (
+ 
+ from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
+ 
++logger = logging.getLogger(__name__)
++
+ GLOO_GROUP = None
+ 
+ 
+@@ -135,8 +138,16 @@ def distributed_masked_whiten(
+     # Calculate global stats from aggregated results
+     global_sum, global_sum_sq, global_mask_sum = stats_tensor
+ 
++    # Empty / fully-masked micro-batches are expected under Polar async GRPO when
++    # sessions emit remove_sample placeholders (loss_mask all zeros) or CP slices
++    # land with no trainable tokens on this DP group. Whitening is undefined then;
++    # skip instead of killing the job — policy/value losses already mask these out.
+     if global_mask_sum.item() == 0:
+-        raise ValueError("The global mask sum across all participating GPUs is zero.")
++        logger.warning(
++            "Skipping advantage whitening: global mask sum across participating "
++            "GPUs is zero (empty/all-masked micro-batch); returning values unchanged."
++        )
++        return values
+ 
+     global_mean = global_sum / global_mask_sum
+     global_mean_sq = global_sum_sq / global_mask_sum
+diff --git a/runs/run_xyne_qa_megatron_peft64_tp2cp4ep8_lora128_e3.sh b/runs/run_xyne_qa_megatron_peft64_tp2cp4ep8_lora128_e3.sh
+old mode 100755
+new mode 100644
+index 0674df4..f91e26d
+--- a/runs/run_xyne_qa_megatron_peft64_tp2cp4ep8_lora128_e3.sh
++++ b/runs/run_xyne_qa_megatron_peft64_tp2cp4ep8_lora128_e3.sh
+@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ PROJECT_ROOT="/root/miles"
+ EXAMPLE_DIR="${PROJECT_ROOT}/miles/examples/polar_swegym_grpo"
+ POLAR_CONFIG_TEMPLATE="/data/siraj/ARL/reward_fix_test/polar_config_xyne_qa.yaml"
+-TRAIN_PY="${PROJECT_ROOT}/train.py"
++TRAIN_PY="${TRAIN_PY:-${PROJECT_ROOT}/train_async_microbatch.py}"
+ MEGATRON_DIR="/root/Megatron-LM"
+ PYTHON_BIN="/usr/bin/python3"
+ RUNTIME_PYTHONPATH="${MEGATRON_DIR}:${PROJECT_ROOT}:/root/miles/polar-pkg"
+@@ -37,7 +37,16 @@ RECOMPUTE_NUM_LAYERS="${RECOMPUTE_NUM_LAYERS:-52}"
+ MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+ MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-25000}"
+ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+-SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-128}"
++# Feed GPUs under Polar max_inflight=64. Mamba pool MUST exceed max_running:
++# when mamba usage hits 1.0 the scheduler wedges (health OK, chat hang, util~0).
++SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
++SGLANG_CHUNKED_PREFILL_SIZE="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
++SGLANG_MAX_PREFILL_TOKENS="${SGLANG_MAX_PREFILL_TOKENS:-4096}"
++# LoRA + cuda-graph / overlap schedule re-wedges Nemotron hybrid decode.
++SGLANG_DISABLE_CUDA_GRAPH="${SGLANG_DISABLE_CUDA_GRAPH:-1}"
++SGLANG_DISABLE_OVERLAP_SCHEDULE="${SGLANG_DISABLE_OVERLAP_SCHEDULE:-1}"
++POLAR_INFERENCE_ADMIN_URL="${POLAR_INFERENCE_ADMIN_URL:-http://127.0.0.1:8100}"
++POLAR_INFERENCE_PAUSE_TIMEOUT="${POLAR_INFERENCE_PAUSE_TIMEOUT:-90}"
+ LORA_RANK="${LORA_RANK:-128}"
+ LORA_ALPHA="${LORA_ALPHA:-256}"
+ LR="${LR:-5e-6}"
+@@ -63,14 +72,84 @@ if [[ "${WANDB_MODE}" == "online" ]] \
+ fi
+ 
+ HF_CHECKPOINT="${HF_CHECKPOINT:-/data/siraj/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
++# Resume anchor: MUST be the iter_0000000 checkpoint from run 20260820_032658.
++# Hardcoded (NOT env-dependent) because the launcher's tmux layer strips exported
++# env vars, which silently dropped --lora-adapter-path and trained a fresh LoRA.
+ LORA_ADAPTER_PATH="${LORA_ADAPTER_PATH:-}"
+ REF_LOAD="${REF_LOAD:-/data/siraj/ARL/checkpoints/nemotron_3_nano_30b_a3b_torch_dist}"
+ PROMPT_DATA="${PROMPT_DATA:-/data/siraj/ARL/data/sebi_pranav_metadata_graph_train.jsonl}"
+ AGENT_CLI_DIR="${AGENT_CLI_DIR:-/data/siraj/ARL/miles/tmp/swegym_agent_cli/opt_node}"
+ XYNE_SERVER_DIR="${XYNE_SERVER_DIR:-/data/siraj/xyne_s/xyne-search}"
+ XYNE_API_KEY="${XYNE_API_KEY:?Set XYNE_API_KEY or source the credentials file}"
+-XYNE_RUNTIME_IMAGE="${XYNE_RUNTIME_IMAGE:-polar-xyne-runtime:withwait}"
+-export AGENT_CLI_DIR XYNE_SERVER_DIR XYNE_API_KEY XYNE_RUNTIME_IMAGE
++XYNE_RUNTIME_IMAGE="${XYNE_RUNTIME_IMAGE:-polar-xyne-runtime:base-e1c2e69e}"
++
++# ---------------------------------------------------------------------------
++# Polar reliability mapping (from TEST-stack rebuild 2026-08-24/25).
++# Keep PROD ports (:3000/:8080/:8100) + local SGLang nemotron (:30100).
++# See: /data/siraj/ARL/logs/test_xyne/E3_POLAR_FIX_MAPPING.md
++# ---------------------------------------------------------------------------
++# 1) Backendv2 polar path is :3000 (not standalone :3001).
++export XYNE_BASE_URL="${XYNE_BASE_URL:-http://localhost:3000}"
++# 2) Judge envsubst must not leave null max_tokens / max_concurrency.
++export XYNE_JUDGE_MAX_TOKENS="${XYNE_JUDGE_MAX_TOKENS:-4096}"
++export XYNE_JUDGE_MAX_CONCURRENCY="${XYNE_JUDGE_MAX_CONCURRENCY:-20}"
++export XYNE_JUDGE_BASE_URL="${XYNE_JUDGE_BASE_URL:-http://192.168.111.7:30100/v1}"
++export XYNE_JUDGE_MODEL="${XYNE_JUDGE_MODEL:-/data/siraj/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
++# 3) Pre-mint access JWT on the host so harness does not mint inside the
++#    runtime container (avoids empty-token / clock-skew 401s).
++if [[ -z "${XYNE_ACCESS_TOKEN:-}" ]]; then
++  XYNE_ACCESS_TOKEN="$(
++    POLAR_CONFIG_TEMPLATE="${POLAR_CONFIG_TEMPLATE}" \
++      "${PYTHON_BIN}" - <<'PY'
++import base64, hashlib, hmac, json, os, re, time
++txt = open(os.environ["POLAR_CONFIG_TEMPLATE"], encoding="utf-8").read()
++
++def grab(pat: str) -> str:
++    m = re.search(pat, txt, flags=re.M)
++    return (m.group(1).strip() if m else "")
++
++def norm(s: str) -> str:
++    s = s.strip()
++    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
++        s = s[1:-1]
++    return s.strip()
++
++secret = norm(grab(r"^\s*ACCESS_TOKEN_SECRET:\s*([^\n#]+)\s*$"))
++email = norm(grab(r"^\s*auth_email:\s*([^\n#]+)\s*$"))
++role = norm(grab(r"^\s*auth_role:\s*([^\n#]+)\s*$"))
++ws = norm(grab(r"^\s*auth_workspace:\s*([^\n#]+)\s*$"))
++if not (secret and email and role and ws):
++    raise SystemExit("JWT mint params missing from polar config template")
++
++def b(bb: bytes) -> str:
++    return base64.urlsafe_b64encode(bb).rstrip(b"=").decode()
++
++h = b(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
++p = {
++    "sub": email,
++    "role": role,
++    "workspaceId": ws,
++    "tokenType": "access",
++    "exp": int(time.time()) + 86400,
++    "authProvider": "google",
++}
++pl = b(json.dumps(p, separators=(",", ":")).encode())
++sg = b(hmac.new(secret.encode(), f"{h}.{pl}".encode(), hashlib.sha256).digest())
++print(f"{h}.{pl}.{sg}")
++PY
++  )"
++  if [[ -z "${XYNE_ACCESS_TOKEN}" ]]; then
++    echo "FATAL: XYNE_ACCESS_TOKEN mint produced empty token" >&2
++    exit 1
++  fi
++fi
++export XYNE_ACCESS_TOKEN
++
++# All envsubst placeholders used by polar_config_xyne_qa.yaml must be exported.
++export AGENT_CLI_DIR XYNE_SERVER_DIR XYNE_API_KEY XYNE_RUNTIME_IMAGE \
++  XYNE_BASE_URL XYNE_ACCESS_TOKEN \
++  XYNE_JUDGE_BASE_URL XYNE_JUDGE_MODEL XYNE_JUDGE_MAX_TOKENS XYNE_JUDGE_MAX_CONCURRENCY \
++  JUSPAY_API_KEY WANDB_API_KEY
+ 
+ if ((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT != GLOBAL_BATCH_SIZE * NUM_STEPS_PER_ROLLOUT)); then
+   echo "Expected rollout_batch_size * group_size == global_batch_size * num_steps_per_rollout" >&2
+@@ -90,6 +169,18 @@ done
+ 
+ CUSTOM_CONFIG_PATH="${RUN_DIR}/polar_config_custom.yaml"
+ envsubst < "${POLAR_CONFIG_TEMPLATE}" > "${CUSTOM_CONFIG_PATH}"
++# Enforce the 30-minute per-question deadline (XYNE_POLL_TIMEOUT_SECONDS=2700,
++# timeout_seconds=2700) so partial answers still get dumped before teardown. The shared
++# POLAR_CONFIG_TEMPLATE carries lower default values; patch only this run's copy.
++sed -i "s/XYNE_POLL_TIMEOUT_SECONDS: '720'/XYNE_POLL_TIMEOUT_SECONDS: '2700'/; s/timeout_seconds: 900/timeout_seconds: 2700/" "${CUSTOM_CONFIG_PATH}"
++# Belt-and-braces: if envsubst left blank judge ints, force defaults (llm_judge int(None) crash).
++sed -i -E 's/^([[:space:]]*max_tokens:[[:space:]]*)$/\1'"${XYNE_JUDGE_MAX_TOKENS}"'/; s/^([[:space:]]*max_concurrency:[[:space:]]*)$/\1'"${XYNE_JUDGE_MAX_CONCURRENCY}"'/' "${CUSTOM_CONFIG_PATH}"
++# Sanity: SEBI agent id + prod backend port must remain in the rendered config.
++grep -q "agent_id: nj5ednjmpfx9qt56s6wiocu6" "${CUSTOM_CONFIG_PATH}" \
++  || { echo "FATAL: rendered polar config missing SEBI agent_id" >&2; exit 1; }
++grep -q "base_url: http://localhost:3000" "${CUSTOM_CONFIG_PATH}" \
++  || { echo "FATAL: rendered polar config base_url is not :3000" >&2; exit 1; }
++echo "=== Polar mapped: XYNE_BASE_URL=${XYNE_BASE_URL}, JWT=preset, agent=SEBI, judge_max_tokens=${XYNE_JUDGE_MAX_TOKENS} ==="
+ 
+ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ export PYTHONPATH="${RUNTIME_PYTHONPATH}"
+@@ -120,6 +211,8 @@ RUNTIME_ENV_JSON="{
+     \"GLOO_SOCKET_IFNAME\": \"${GLOO_SOCKET_IFNAME}\",
+     \"MILES_POLAR_MAX_TRACES_PER_SESSION\": \"${MILES_POLAR_MAX_TRACES_PER_SESSION}\",
+     \"MILES_POLAR_TRAJECTORY_DUMP_DIR\": \"${TRAJECTORY_DUMP_DIR}\",
++    \"POLAR_INFERENCE_ADMIN_URL\": \"${POLAR_INFERENCE_ADMIN_URL}\",
++    \"POLAR_INFERENCE_PAUSE_TIMEOUT\": \"${POLAR_INFERENCE_PAUSE_TIMEOUT}\",
+     \"WANDB_API_KEY\": \"${WANDB_API_KEY:-}\",
+     \"WANDB_BASE_URL\": \"${WANDB_BASE_URL:-https://api.wandb.ai}\",
+     \"WANDB_MODE\": \"${WANDB_MODE}\",
+@@ -131,6 +224,7 @@ RUNTIME_ENV_JSON="{
+ source "${EXAMPLE_DIR}/model_args.sh"
+ 
+ CKPT_ARGS=(
++  --load "${SAVE_DIR}"
+   --hf-checkpoint "${HF_CHECKPOINT}"
+   --no-load-optim
+   --no-load-rng
+@@ -145,7 +239,7 @@ if [[ -n "${LORA_ADAPTER_PATH}" ]]; then
+ fi
+ 
+ POLAR_ARGS=(
+-  --rollout-function-path miles.rollout.polar_rollout.generate_rollout_polar_async
++  --rollout-function-path miles.rollout.polar_rollout.generate_rollout_polar_async_microbatch
+   --custom-rm-path miles.rollout.polar_reward.custom_rm
+   --custom-reward-post-process-path miles.rollout.polar_reward.post_process_rewards
+   --custom-config-path "${CUSTOM_CONFIG_PATH}"
+@@ -163,8 +257,8 @@ DATA_ARGS=(
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
+   --global-batch-size "${GLOBAL_BATCH_SIZE}"
+-  --rollout-max-response-len 128
+-  --rollout-max-prompt-len 2048
++  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-100000}"
++  --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN:-100000}"
+   --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
+ )
+ if [[ -n "${NUM_ROLLOUT}" ]]; then
+@@ -209,12 +303,10 @@ PARALLEL_ARGS=(
+ GRPO_ARGS=(
+   --advantage-estimator grpo
+   --normalize-advantages
+-  --use-rollout-logprobs
++  --use-rollout-logprobs --true-on-policy-mode --recompute-logprobs-via-prefill
+   --entropy-coef 0.001
+   --eps-clip 0.2
+   --eps-clip-high 0.28
+-  --use-kl-loss --kl-loss-coef 0.05 --kl-loss-type low_var_kl
+-  --ref-load "${REF_LOAD}"
+   --dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+ )
+ 
+@@ -245,15 +337,22 @@ LORA_ARGS=(
+   --target-modules q_proj,v_proj,gate_proj,up_proj,down_proj
+   --sglang-lora-backend triton
+   --sglang-moe-runner-backend triton
+-  --sglang-mem-fraction-static 0.75
++  --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.80}"
+   --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
++  --sglang-chunked-prefill-size "${SGLANG_CHUNKED_PREFILL_SIZE}"
++  --sglang-max-prefill-tokens "${SGLANG_MAX_PREFILL_TOKENS}"
+   --sglang-context-length "${SGLANG_CONTEXT_LENGTH}"
+-  --sglang-kv-cache-dtype fp8_e4m3
+-  --sglang-reasoning-parser nemotron_3
+-  --sglang-tool-call-parser qwen3_coder
+   --sglang-router-port 30100
++      --sglang-tool-call-parser qwen3_coder
++      --sglang-served-model-name nemotron
+   --sglang-router-policy round_robin
+ )
++if [[ "${SGLANG_DISABLE_CUDA_GRAPH}" == "1" ]]; then
++  LORA_ARGS+=(--sglang-disable-cuda-graph)
++fi
++if [[ "${SGLANG_DISABLE_OVERLAP_SCHEDULE}" == "1" ]]; then
++  LORA_ARGS+=(--sglang-disable-overlap-schedule)
++fi
+ 
+ TRACKING_ARGS=(
+   --use-wandb
+@@ -277,6 +376,7 @@ echo "=== Trajectory dumps: ${TRAJECTORY_DUMP_DIR} (compressed JSONL, every trac
+ echo "=== W&B: project=${WANDB_PROJECT}, group=${WANDB_GROUP}, mode=${WANDB_MODE} ==="
+ 
+ ray job submit --address="${RAY_DASHBOARD_ADDRESS}" \
++  --no-wait \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   -- "${PYTHON_BIN}" "${TRAIN_PY}" \
+   --actor-num-nodes 1 \

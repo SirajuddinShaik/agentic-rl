@@ -1,0 +1,1242 @@
+import { getLogger } from "@/platform/logger"
+import { Subsystem, type ChunkMetadata } from "@/types"
+import { createCanvas, Image as CanvasImage, ImageData } from "canvas"
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs"
+import path from "path"
+import imageType from "image-type"
+import { promises as fsPromises } from "fs"
+import crypto from "crypto"
+import {
+  DeferredImageDescriptionBatch,
+  md5ImageBuffer,
+} from "@/platform/lib/deferredImageDescription"
+import { DATASOURCE_CONFIG } from "@/integrations/dataSource/config"
+import { chunkTextByParagraph } from "./chunks"
+
+const openjpegWasmPath =
+  path.join(__dirname, "../node_modules/pdfjs-dist/wasm/") + "/"
+const qcmsWasmPath =
+  path.join(__dirname, "../node_modules/pdfjs-dist/wasm/") + "/"
+const MIN_IMAGE_DIM_PX = parseInt(process.env.MIN_IMAGE_DIM_PX || "150", 10)
+
+const Logger = getLogger(Subsystem.Integrations).child({
+  module: "pdfChunks",
+})
+
+const PDFJS = pdfjsLib
+
+export function normalizeText(input: string): string {
+  if (!input) return ""
+
+  let normalized = input.normalize("NFC")
+
+  // Strip control chars except newline/tab
+  normalized = normalized.replace(/[^\P{C}\n\t]/gu, "")
+
+  // Normalize whitespace
+  normalized = normalized.replace(/\u00A0/g, " ") // nbsp → space
+  normalized = normalized.replace(/\u200B/g, "") // zero-width space
+  normalized = normalized.replace(/\t+/g, " ") // tabs → single space
+
+  return normalized.trim()
+}
+
+// Collapse per-line letter-spacing (e.g. PDF exports that space out every glyph).
+function smartDespaceLine(line: string): string {
+  if (!line) return line
+
+  const parts = line.split(/(\s+)/)
+  const out: string[] = []
+
+  const isSingleAllowed = (s: string) =>
+    s.length === 1 && /[\p{L}\p{N}'’]/u.test(s)
+
+  const isSingleLowerLetter = (s: string) => s.length === 1 && /\p{Ll}/u.test(s)
+
+  let i = 0
+  while (i < parts.length) {
+    const tok = parts[i]
+    if (tok === undefined) {
+      i += 1
+      continue
+    }
+
+    if (!/\s+/.test(tok) && isSingleAllowed(tok)) {
+      const runTokens: string[] = [tok]
+      let j = i + 1
+
+      while (j + 1 < parts.length && parts[j] === " ") {
+        const next = parts[j + 1]
+        if (next === undefined || /\s+/.test(next) || !isSingleAllowed(next)) {
+          break
+        }
+        runTokens.push(next)
+        j += 2
+      }
+
+      // Join spaced letters like "N A S A" -> "NASA"
+      if (runTokens.length >= 3) {
+        out.push(runTokens.join(""))
+        i = j
+        continue
+      }
+
+      // Join two-letter lowercase sequences like "i s" -> "is"
+      if (
+        runTokens.length === 2 &&
+        isSingleLowerLetter(runTokens[0] ?? "") &&
+        isSingleLowerLetter(runTokens[1] ?? "")
+      ) {
+        out.push(runTokens.join(""))
+        i = j
+        continue
+      }
+    }
+
+    out.push(tok)
+    i += 1
+  }
+
+  return out.join("")
+}
+
+// High-level text cleaner.
+export function cleanText(input: string): string {
+  let s = normalizeText(input)
+
+  // Fix hyphenation across line breaks
+  s = s.replace(/(\p{L})-\n(\p{L})/gu, "$1$2")
+
+  s = s.replace(/[ \t]*\n[ \t]*/g, "\n")
+
+  // Collapse soft-wrap newlines to spaces while preserving paragraph breaks:
+  // stash the blank-line breaks behind a unique placeholder, flatten the rest, then restore.
+  const uniqueParaPlaceholder = `\uE000XYNE_PARA_BREAK_${Math.random().toString(36).substring(2)}\uE001`
+  s = s.replace(/\n{2,}/g, uniqueParaPlaceholder)
+  s = s.replace(/\n+/g, " ")
+  s = s.replace(
+    new RegExp(
+      uniqueParaPlaceholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      "g",
+    ),
+    "\n\n",
+  )
+
+  // Apply line-wise despacing
+  s = s
+    .split("\n")
+    .map((line) => smartDespaceLine(line))
+    .join("\n")
+
+  // Remove spaces before punctuation
+  s = s.replace(/\s+([.,;:!?])/g, "$1")
+
+  // Cap extreme space runs, preserve 2–4 spaces
+  s = s.replace(/[ ]{5,}/g, "    ")
+
+  // Trim lines & drop empties
+  s = s
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .join("\n")
+
+  return s.trim()
+}
+
+/**
+ * Multiply two 2D transformation matrices.
+ * Each matrix is [a, b, c, d, e, f] corresponding to:
+ * [a  c  e]
+ * [b  d  f]
+ * [0  0  1]
+ */
+function multiplyMatrices(
+  m1: number[],
+  m2: number[],
+): [number, number, number, number, number, number] {
+  const [a1, b1, c1, d1, e1, f1] = m1 as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ]
+  const [a2, b2, c2, d2, e2, f2] = m2 as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ]
+  return [
+    a1 * a2 + c1 * b2,
+    b1 * a2 + d1 * b2,
+    a1 * c2 + c1 * d2,
+    b1 * c2 + d1 * d2,
+    a1 * e2 + c1 * f2 + e1,
+    b1 * e2 + d1 * f2 + f1,
+  ]
+}
+
+/**
+ * Validate text item
+ */
+
+// Chunk collected paragraphs into results. Returns trailing overlap text for cross-page continuity.
+function processTextParagraphs(
+  paragraphs: string[],
+  text_chunks: string[],
+  text_chunk_pos: number[],
+  text_chunks_map: ChunkMetadata[],
+  globalSeq: { value: number },
+  pageNum: number,
+  hasPrevPageOverlap: boolean,
+  overlapBytes: number = 32,
+): string {
+  Logger.debug("Processing paragraphs", { count: paragraphs.length })
+
+  if (paragraphs.length === 0) {
+    Logger.debug("No paragraphs to process")
+    return ""
+  }
+
+  const cleanedParagraphs = paragraphs
+    .map(cleanText)
+    .filter((p) => p.length > 0)
+  if (cleanedParagraphs.length === 0) {
+    Logger.debug("No cleaned paragraphs after filtering")
+    return ""
+  }
+
+  const cleanedText = cleanedParagraphs.join("\n")
+
+  const chunks = chunkTextByParagraph(cleanedText, 512, 128)
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
+
+    // First chunk may carry overlap from the previous page, so it spans two pages.
+    let page_numbers: number[]
+    if (i === 0 && hasPrevPageOverlap) {
+      page_numbers = [pageNum - 2, pageNum - 1]
+    } else {
+      page_numbers = [pageNum - 1]
+    }
+    const firstPage = page_numbers[0] ?? pageNum - 1
+    const lastPage = page_numbers[page_numbers.length - 1] ?? pageNum - 1
+    const pageLabel =
+      page_numbers.length > 1
+        ? `[Page ${firstPage + 1}-${lastPage + 1}]`
+        : `[Page ${firstPage + 1}]`
+    text_chunks.push(`${pageLabel} ${chunk}`)
+    text_chunk_pos.push(globalSeq.value)
+    text_chunks_map.push({
+      chunk_index: globalSeq.value,
+      page_numbers: page_numbers,
+      block_labels: ["text"],
+    })
+
+    globalSeq.value++
+  }
+
+  // Overlap = last ~overlapBytes of text, used to keep continuity onto the next page.
+  let overlapText = ""
+  let overlapLen = 0
+
+  for (let i = cleanedText.length - 1; i >= 0; i--) {
+    const char = cleanedText[i]
+    if (char === undefined) continue
+    const charBytes = Buffer.byteLength(char, "utf8")
+    if (overlapLen + charBytes > overlapBytes) {
+      break
+    }
+    overlapText = char + overlapText
+    overlapLen += charBytes
+  }
+
+  return overlapText
+}
+
+export async function extractTextAndImagesWithChunksFromPDF(
+  data: Uint8Array,
+  docid: string = crypto.randomUUID(),
+  extractImages: boolean = false,
+  describeImages: boolean = true,
+): Promise<{
+  text_chunks: string[]
+  image_chunks: string[]
+  text_chunk_pos: number[]
+  image_chunk_pos: number[]
+  text_chunks_map: ChunkMetadata[]
+  image_chunks_map: ChunkMetadata[]
+  documentOutline?: string
+}> {
+  Logger.debug("Starting processing with parameters", {
+    docid,
+    extractImages,
+    describeImages,
+    dataSize: data.length,
+  })
+
+  const loadingTask = PDFJS.getDocument({
+    data,
+    wasmUrl: openjpegWasmPath,
+    iccUrl: qcmsWasmPath,
+    verbosity: PDFJS.VerbosityLevel.ERRORS, // Only show errors, suppress warnings
+  })
+  let pdfDocument: pdfjsLib.PDFDocumentProxy
+  try {
+    pdfDocument = await loadingTask.promise
+  } catch (error) {
+    const { name, message } = error as Error
+    if (
+      message.includes("PasswordException") ||
+      name.includes("PasswordException")
+    ) {
+      Logger.warn("Password protected PDF, skipping")
+    } else {
+      Logger.error(error, `PDF load error: ${error}`)
+    }
+    return {
+      text_chunks: [],
+      image_chunks: [],
+      text_chunk_pos: [],
+      image_chunk_pos: [],
+      text_chunks_map: [],
+      image_chunks_map: [],
+    }
+  }
+
+  const imageDescribeBatch = new DeferredImageDescriptionBatch()
+  let extractionSucceeded = false
+  try {
+    let text_chunks: string[] = []
+    let image_chunks: string[] = []
+    let text_chunk_pos: number[] = []
+    let image_chunk_pos: number[] = []
+    let text_chunks_map: ChunkMetadata[] = []
+    let image_chunks_map: ChunkMetadata[] = []
+    const imageSeqToHash = new Map<number, string>()
+
+    // Boxed so nested closures share one sequence counter.
+    let globalSeq = { value: 0 }
+    let pageOverlap = ""
+
+    async function commitPngImage(
+      buffer: Buffer,
+      type: { mime: string; ext?: string },
+      imageHash: string,
+      imageName: string,
+      pageNum: number,
+      imagesOnPage: { n: number },
+      savedLogLabel?: string,
+    ): Promise<boolean> {
+      let imagePath: string
+      try {
+        const baseDir = path.resolve(
+          process.env.IMAGE_DIR || "downloads/xyne_images_db",
+        )
+        const outputDir = path.join(baseDir, docid)
+        await fsPromises.mkdir(outputDir, { recursive: true })
+        const imageFilename = `${globalSeq.value}.${type.ext || "png"}`
+        imagePath = path.join(outputDir, imageFilename)
+        await fsPromises.writeFile(imagePath, buffer as NodeJS.ArrayBufferView)
+        Logger.info(
+          savedLogLabel
+            ? `Saved image (${savedLogLabel}) to: ${imagePath}`
+            : `Saved image to: ${imagePath}`,
+        )
+      } catch (e) {
+        Logger.error(
+          `Failed to save image for ${imageName} on page ${pageNum}: ${e instanceof Error ? e.message : e}`,
+        )
+        return false
+      }
+
+      const description = imageDescribeBatch.registerImagePathForLaterDescribe(
+        imageHash,
+        path.resolve(imagePath),
+        describeImages,
+      )
+
+      image_chunks.push(description)
+      image_chunk_pos.push(globalSeq.value)
+      imageSeqToHash.set(globalSeq.value, imageHash)
+      image_chunks_map.push({
+        chunk_index: globalSeq.value,
+        page_numbers: [pageNum - 1],
+        block_labels: ["image"],
+      })
+      Logger.debug("Added image chunk at position", {
+        position: globalSeq.value,
+        imageName,
+        description,
+      })
+      globalSeq.value++
+      imagesOnPage.n += 1
+      return true
+    }
+
+    Logger.info(`PDF has ${pdfDocument.numPages} pages`)
+
+    // Extract text via PDF.js textContent API.
+    const buildParagraphsFromPage = async (
+      page: pdfjsLib.PDFPageProxy,
+    ): Promise<string[]> => {
+      const textContent = await page.getTextContent({
+        includeMarkedContent: false,
+        disableNormalization: false,
+      })
+
+      // Reconstruct lines from hasEOL flags and Y-position jumps (handles PPT/DOC exports).
+      const lines: string[] = []
+      let current = ""
+      let prevY: number | null = null
+      let prevH: number | null = null
+      for (const item of textContent.items as any[]) {
+        const str: string = item && typeof item.str === "string" ? item.str : ""
+        if (!str) continue
+
+        const tr = Array.isArray(item.transform) ? item.transform : []
+        const y = typeof tr[5] === "number" ? tr[5] : null
+        const h = typeof item.height === "number" ? item.height : null
+
+        let newLine = false
+        if (prevY != null && y != null) {
+          const tol = Math.max(prevH || 0, h || 0, 10) * 0.4 // dynamic tolerance
+          if (Math.abs(y - prevY) > tol) newLine = true
+        }
+
+        if (newLine || (item as any).hasEOL) {
+          if (current.length > 0) lines.push(current)
+          current = str
+        } else {
+          current += str
+        }
+
+        prevY = y
+        prevH = h
+      }
+      if (current.trim().length > 0) lines.push(current)
+
+      // Group lines into paragraphs separated by blank lines.
+      const paragraphs: string[] = []
+      let buf: string[] = []
+      const pushPara = () => {
+        if (buf.length === 0) return
+        paragraphs.push(buf.join("\n"))
+        buf = []
+      }
+      for (const ln of lines) {
+        if (ln.trim().length === 0) pushPara()
+        else buf.push(ln)
+      }
+      pushPara()
+
+      // Drop empties only; full cleaning is deferred to processTextParagraphs.
+      return paragraphs.filter((p) => p.trim().length > 0)
+    }
+
+    for (let pageNum = 1; pageNum <= pdfDocument.numPages; pageNum++) {
+      Logger.debug(`Processing page ${pageNum}`)
+
+      const page = await pdfDocument.getPage(pageNum)
+      try {
+        const opList = await page.getOperatorList()
+
+        let paragraphs: string[] = await buildParagraphsFromPage(page)
+
+        let textOperatorCount = (await page.getTextContent()).items.length
+
+        // Capture before pageOverlap is consumed below.
+        const hasPrevPageOverlap = pageOverlap.trim().length > 0
+
+        // Prepend previous-page overlap to the first paragraph for continuity.
+        if (pageOverlap && paragraphs.length > 0) {
+          paragraphs[0] = `${pageOverlap} ${paragraphs[0]}`
+          pageOverlap = ""
+        } else if (pageOverlap) {
+          paragraphs = [pageOverlap]
+          pageOverlap = ""
+        }
+
+        Logger.debug("Text extraction summary for page", {
+          pageNum,
+          primaryParagraphs: paragraphs.length,
+
+          finalParagraphs: paragraphs.length,
+          textOperatorCount,
+          initialPageOverlap: pageOverlap,
+        })
+
+        // Resolve an image object by name from page.objs.
+        const resolveImageByName = async (
+          name: string,
+        ): Promise<any | null> => {
+          try {
+            // Some pdf.js builds expose a has() method; prefer it when present.
+            // @ts-ignore
+            if (
+              typeof (page.objs as any).has === "function" &&
+              (page.objs as any).has(name)
+            ) {
+              // @ts-ignore
+              return (page.objs as any).get(name)
+            }
+            const obj = (page.objs as any).get(name)
+            return obj || null
+          } catch (e) {
+            return null
+          }
+        }
+
+        // Track the CTM to compute image bounds when raw image data isn't retrievable.
+        let currentCTM: [number, number, number, number, number, number] = [
+          1, 0, 0, 1, 0, 0,
+        ]
+        const ctmStack: [number, number, number, number, number, number][] = []
+
+        const imagesOnPage = { n: 0 }
+        for (let i = 0; i < opList.fnArray.length; i++) {
+          const fnId = opList.fnArray[i]
+          const args = opList.argsArray[i]
+
+          switch (fnId) {
+            case PDFJS.OPS.showText:
+            case PDFJS.OPS.showSpacedText:
+            case PDFJS.OPS.nextLine:
+            case PDFJS.OPS.nextLineShowText:
+            case PDFJS.OPS.nextLineSetSpacingShowText: {
+              // Text comes from buildParagraphsFromPage; nothing to do per operator.
+              break
+            }
+            // Positioning operators: only track the CTM here; paragraph splitting is done via textContent.
+            case PDFJS.OPS.transform:
+            case PDFJS.OPS.setTextMatrix:
+            case PDFJS.OPS.moveText: {
+              if (fnId === PDFJS.OPS.transform) {
+                try {
+                  if (
+                    Array.isArray(args) &&
+                    args.length >= 6 &&
+                    args.every((n: any) => typeof n === "number")
+                  ) {
+                    currentCTM = multiplyMatrices(currentCTM, args as number[])
+                  }
+                } catch {}
+              }
+              break
+            }
+            case PDFJS.OPS.save: {
+              ctmStack.push([...currentCTM])
+              break
+            }
+            case PDFJS.OPS.restore: {
+              if (ctmStack.length) currentCTM = ctmStack.pop()!
+              break
+            }
+            case extractImages ? PDFJS.OPS.paintImageXObject : null:
+            case extractImages ? PDFJS.OPS.paintImageXObjectRepeat : null:
+            case extractImages ? PDFJS.OPS.paintInlineImageXObject : null:
+            case extractImages ? PDFJS.OPS.paintImageMaskXObject : null: {
+              Logger.debug("Image operator detected", {
+                pageNum,
+                extractImages,
+                operatorType: fnId,
+                imageName: args[0],
+              })
+
+              const imageName =
+                typeof args?.[0] === "string"
+                  ? args[0]
+                  : args?.[0] &&
+                      typeof args[0] === "object" &&
+                      typeof args[0].name === "string"
+                    ? args[0].name
+                    : args?.[0]
+              Logger.debug("Processing image", { imageName })
+              let imageDict: any | null = null
+              let isInline = false
+              // Inline images carry their pixel data directly in the operator args.
+              Logger.debug("Image operator details", {
+                args: args.length,
+                fnId,
+                paintInlineImageXObject: PDFJS.OPS.paintInlineImageXObject,
+              })
+              if (fnId === PDFJS.OPS.paintInlineImageXObject) {
+                Logger.debug("Detected inline image data in args")
+                const candidate = Array.isArray(args)
+                  ? args.find(
+                      (a: any) =>
+                        a &&
+                        typeof a === "object" &&
+                        ("data" in a || "imgData" in a) &&
+                        "width" in a &&
+                        "height" in a,
+                    )
+                  : null
+                if (candidate) {
+                  imageDict = candidate
+                  isInline = true
+                }
+              }
+              Logger.debug("Initial imageDict resolved", {
+                hasImageDict: !!imageDict,
+                isInline,
+              })
+              if (
+                !imageDict &&
+                (typeof imageName === "string" ||
+                  (imageName &&
+                    typeof imageName === "object" &&
+                    typeof imageName.name === "string"))
+              ) {
+                const name =
+                  typeof imageName === "string" ? imageName : imageName.name
+                imageDict = await resolveImageByName(name)
+              }
+
+              // Without the raw image object there's nothing to extract.
+              if (!imageDict) {
+                Logger.debug(
+                  `No image object available for ${imageName} on page ${pageNum} — skipping`,
+                )
+                continue
+              }
+              Logger.debug("Resolved imageDict", {
+                hasImageDict: !!imageDict,
+                isInline,
+              })
+
+              if (!imageDict || typeof imageDict !== "object") {
+                Logger.debug(
+                  "imageDict is null or invalid, skipping to crop fallback",
+                )
+              } else {
+                try {
+                  const width: number = (imageDict.width ??
+                    imageDict.w) as number
+                  const height: number = (imageDict.height ??
+                    imageDict.h) as number
+                  const kind =
+                    imageDict.kind ?? imageDict.imageKind ?? imageDict.ImageKind
+                  // Pixel data location varies by pdf.js build: .data, .bytes, or .imgData.data.
+                  let rawData: any =
+                    imageDict.data ??
+                    imageDict.bytes ??
+                    (imageDict.imgData ? imageDict.imgData.data : undefined)
+
+                  Logger.debug("Full image details", {
+                    imageName,
+                    width,
+                    height,
+                    kind,
+                    dataLength: rawData ? rawData.length : null,
+                    dataSizeMB: rawData
+                      ? (rawData.length / (1024 * 1024)).toFixed(2)
+                      : null,
+                    maxAllowedSizeMB: DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB,
+                    minDimension: MIN_IMAGE_DIM_PX,
+                    isValidDimensions: width > 0 && height > 0,
+                    meetsMinSize:
+                      width >= MIN_IMAGE_DIM_PX && height >= MIN_IMAGE_DIM_PX,
+                    withinSizeLimit: rawData
+                      ? rawData.length <=
+                        DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB * 1024 * 1024
+                      : false,
+                    isInline,
+                  })
+
+                  if (!width || !height || width <= 0 || height <= 0) {
+                    Logger.debug("Skipped image with invalid dimensions", {
+                      imageName,
+                      width,
+                      height,
+                    })
+                    continue
+                  }
+
+                  if (
+                    rawData &&
+                    rawData.length >
+                      DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB * 1024 * 1024
+                  ) {
+                    Logger.warn("Skipped large image", {
+                      imageName,
+                      actualSizeMB: (rawData.length / (1024 * 1024)).toFixed(2),
+                      maxAllowedMB: DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB,
+                    })
+                    continue
+                  }
+
+                  if (width < MIN_IMAGE_DIM_PX || height < MIN_IMAGE_DIM_PX) {
+                    Logger.debug("Skipped small image", {
+                      imageName,
+                      width,
+                      height,
+                      minRequired: MIN_IMAGE_DIM_PX,
+                    })
+                    continue
+                  }
+
+                  Logger.debug(
+                    "Image passed all filters, proceeding with processing",
+                    {
+                      imageName,
+                    },
+                  )
+                  // Fast paths for Canvas/Image-like objects returned by page.objs.
+                  const isCanvasLike = (obj: any) =>
+                    obj &&
+                    typeof obj.getContext === "function" &&
+                    typeof obj.width === "number" &&
+                    typeof obj.height === "number"
+                  const isImageLike = (obj: any) =>
+                    obj &&
+                    typeof obj.width === "number" &&
+                    typeof obj.height === "number" &&
+                    typeof obj.getContext !== "function"
+
+                  if (isCanvasLike(imageDict)) {
+                    const c: any = imageDict
+                    const width: number = c.width
+                    const height: number = c.height
+                    if (width < MIN_IMAGE_DIM_PX || height < MIN_IMAGE_DIM_PX) {
+                      Logger.debug("Skipped small canvas image", {
+                        imageName,
+                        width,
+                        height,
+                        minRequired: MIN_IMAGE_DIM_PX,
+                      })
+                    } else {
+                      const buffer = c.toBuffer("image/png")
+                      // Filter before scheduling a (costly) LLM description.
+                      if (
+                        buffer.length >
+                        DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB * 1024 * 1024
+                      ) {
+                        Logger.warn(
+                          `Skipping objs/canvas image due to size ${(buffer.length / (1024 * 1024)).toFixed(2)} MB: ${imageName}`,
+                        )
+                      } else {
+                        // @ts-ignore
+                        let type = await imageType(buffer)
+                        if (!type) type = { mime: "image/png", ext: "png" }
+                        if (
+                          DATASOURCE_CONFIG.SUPPORTED_IMAGE_TYPES.has(type.mime)
+                        ) {
+                          const imageHash = md5ImageBuffer(buffer)
+                          const ok = await commitPngImage(
+                            buffer,
+                            type,
+                            imageHash,
+                            String(imageName),
+                            pageNum,
+                            imagesOnPage,
+                            "objs/canvas",
+                          )
+                          if (ok) {
+                            Logger.debug(
+                              `Successfully processed objs/canvas image ${imageName} on page ${pageNum}`,
+                            )
+                          }
+                          break
+                        }
+                      }
+                    }
+                  }
+
+                  if (isImageLike(imageDict)) {
+                    const imgLike: any = imageDict
+                    const width: number = imgLike.width
+                    const height: number = imgLike.height
+                    if (width < MIN_IMAGE_DIM_PX || height < MIN_IMAGE_DIM_PX) {
+                      Logger.debug("Skipped small image-like object", {
+                        imageName,
+                        width,
+                        height,
+                        minRequired: MIN_IMAGE_DIM_PX,
+                      })
+                    } else {
+                      const cnv = createCanvas(width, height)
+                      const cctx = cnv.getContext("2d")
+
+                      try {
+                        // @ts-ignore draw directly
+                        cctx.drawImage(imgLike, 0, 0)
+                        const buffer = cnv.toBuffer("image/png")
+                        // Filter before scheduling a (costly) LLM description.
+                        if (
+                          buffer.length >
+                          DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB * 1024 * 1024
+                        ) {
+                          Logger.warn(
+                            `Skipping objs/image image due to size ${(buffer.length / (1024 * 1024)).toFixed(2)} MB: ${imageName}`,
+                          )
+                          break
+                        }
+                        // @ts-ignore
+                        let type = await imageType(buffer)
+                        if (!type) type = { mime: "image/png", ext: "png" }
+                        if (
+                          DATASOURCE_CONFIG.SUPPORTED_IMAGE_TYPES.has(type.mime)
+                        ) {
+                          const imageHash = md5ImageBuffer(buffer)
+                          const ok = await commitPngImage(
+                            buffer,
+                            type,
+                            imageHash,
+                            String(imageName),
+                            pageNum,
+                            imagesOnPage,
+                            "objs/image",
+                          )
+                          if (ok) {
+                            Logger.debug(
+                              `Successfully processed objs/image image ${imageName} on page ${pageNum}`,
+                            )
+                          }
+                          break
+                        }
+                      } catch (e) {
+                        Logger.debug(
+                          `Drawing objs image failed for ${imageName} on page ${pageNum}: ${e instanceof Error ? e.message : e}`,
+                        )
+                      }
+                    }
+                  }
+
+                  let uint8Data: Uint8Array
+                  if (rawData instanceof Uint8Array) {
+                    uint8Data = rawData
+                  } else if (
+                    rawData &&
+                    typeof rawData === "object" &&
+                    rawData.length !== undefined
+                  ) {
+                    uint8Data = new Uint8Array(rawData)
+                  } else {
+                    Logger.debug(`Invalid image data format for ${imageName}`)
+                    continue
+                  }
+
+                  const canvas = createCanvas(width, height)
+                  const ctx = canvas.getContext("2d")
+                  let imageProcessed = false
+
+                  switch (kind) {
+                    case pdfjsLib.ImageKind.GRAYSCALE_1BPP:
+                    case pdfjsLib.ImageKind.RGB_24BPP:
+                    case pdfjsLib.ImageKind.RGBA_32BPP: {
+                      let expectedLength: number
+                      if (kind === pdfjsLib.ImageKind.GRAYSCALE_1BPP) {
+                        // 1bpp is bit-packed: 8 pixels per byte.
+                        expectedLength = Math.ceil((width * height) / 8)
+                      } else {
+                        const bytesPerPixel =
+                          kind === pdfjsLib.ImageKind.RGBA_32BPP ? 4 : 3
+                        expectedLength = width * height * bytesPerPixel
+                      }
+
+                      if (uint8Data.length >= expectedLength) {
+                        const rgbaData = new Uint8ClampedArray(
+                          width * height * 4,
+                        )
+
+                        if (kind === pdfjsLib.ImageKind.GRAYSCALE_1BPP) {
+                          let pixelIndex = 0
+                          for (let y = 0; y < height; y++) {
+                            for (let x = 0; x < width; x++) {
+                              const byteIndex = Math.floor(pixelIndex / 8)
+                              const bitIndex = 7 - (pixelIndex % 8) // MSB first
+                              const bit =
+                                byteIndex < uint8Data.length
+                                  ? ((uint8Data[byteIndex] ?? 0) >> bitIndex) & 1
+                                  : 0
+                              const gray = bit ? 255 : 0
+
+                              const dstIdx = pixelIndex * 4
+                              rgbaData[dstIdx] = gray
+                              rgbaData[dstIdx + 1] = gray
+                              rgbaData[dstIdx + 2] = gray
+                              rgbaData[dstIdx + 3] = 255
+                              pixelIndex++
+                            }
+                          }
+                        } else {
+                          const bytesPerPixel =
+                            kind === pdfjsLib.ImageKind.RGBA_32BPP ? 4 : 3
+                          for (let i = 0; i < width * height; i++) {
+                            const srcIdx = i * bytesPerPixel
+                            const dstIdx = i * 4
+                            if (kind === pdfjsLib.ImageKind.RGB_24BPP) {
+                              rgbaData[dstIdx] =
+                                srcIdx < uint8Data.length
+                                  ? (uint8Data[srcIdx] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 1] =
+                                srcIdx + 1 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 1] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 2] =
+                                srcIdx + 2 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 2] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 3] = 255
+                            } else {
+                              rgbaData[dstIdx] =
+                                srcIdx < uint8Data.length
+                                  ? (uint8Data[srcIdx] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 1] =
+                                srcIdx + 1 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 1] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 2] =
+                                srcIdx + 2 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 2] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 3] =
+                                srcIdx + 3 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 3] ?? 255)
+                                  : 255
+                            }
+                          }
+                        }
+                        const imageData = new ImageData(rgbaData, width, height)
+                        ctx.putImageData(imageData, 0, 0)
+                        imageProcessed = true
+                      }
+                      break
+                    }
+                    default: {
+                      try {
+                        const imgBuffer = Buffer.from(uint8Data.buffer)
+                        const img = new CanvasImage()
+                        await new Promise<void>((resolve, reject) => {
+                          img.onload = () => resolve()
+                          img.onerror = (err) => reject(err)
+                          img.src = imgBuffer
+                        })
+                        ctx.drawImage(img, 0, 0)
+                        imageProcessed = true
+                      } catch (err) {
+                        try {
+                          const rgbaData = new Uint8ClampedArray(
+                            width * height * 4,
+                          )
+                          const bytesPerPixel = Math.floor(
+                            uint8Data.length / (width * height),
+                          )
+
+                          if (bytesPerPixel >= 3) {
+                            for (let i = 0; i < width * height; i++) {
+                              const srcIdx = i * bytesPerPixel
+                              const dstIdx = i * 4
+                              rgbaData[dstIdx] =
+                                srcIdx < uint8Data.length
+                                  ? (uint8Data[srcIdx] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 1] =
+                                srcIdx + 1 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 1] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 2] =
+                                srcIdx + 2 < uint8Data.length
+                                  ? (uint8Data[srcIdx + 2] ?? 0)
+                                  : 0
+                              rgbaData[dstIdx + 3] = 255
+                            }
+                            const imageData = new ImageData(
+                              rgbaData,
+                              width,
+                              height,
+                            )
+                            ctx.putImageData(imageData, 0, 0)
+                            imageProcessed = true
+                          }
+                        } catch {
+                          Logger.debug(
+                            `Failed to process image ${imageName} with fallback method`,
+                          )
+                        }
+                      }
+                    }
+                  }
+
+                  Logger.debug("Image processing result", {
+                    imageName,
+                    imageProcessed,
+                    canvasWidth: canvas.width,
+                    canvasHeight: canvas.height,
+                  })
+
+                  if (imageProcessed) {
+                    Logger.debug("Converting to PNG buffer", { imageName })
+                    const buffer = canvas.toBuffer("image/png")
+                    if (
+                      buffer.length >
+                      DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB * 1024 * 1024
+                    ) {
+                      Logger.warn(
+                        `Skipping encoded image > ${DATASOURCE_CONFIG.MAX_IMAGE_FILE_SIZE_MB} MB (size ${(buffer.length / (1024 * 1024)).toFixed(2)} MB)`,
+                      )
+                      continue
+                    }
+                    Logger.debug("PNG buffer created", {
+                      imageName,
+                      size: buffer.length,
+                    })
+
+                    // @ts-ignore
+                    let type = await imageType(buffer)
+                    Logger.debug("Image type detection result", {
+                      imageName,
+                      type,
+                    })
+
+                    if (!type) {
+                      Logger.debug(
+                        "Could not determine MIME type, using default",
+                        {
+                          imageName,
+                          default: "image/png",
+                        },
+                      )
+                      Logger.warn(
+                        `Could not determine MIME type for ${imageName}. Defaulting to image/png`,
+                      )
+                      type = { mime: "image/png", ext: "png" }
+                    }
+
+                    Logger.debug("Checking MIME type support", {
+                      imageName,
+                      detectedMime: type.mime,
+                      supportedMimes: Array.from(
+                        DATASOURCE_CONFIG.SUPPORTED_IMAGE_TYPES,
+                      ),
+                      isSupported: DATASOURCE_CONFIG.SUPPORTED_IMAGE_TYPES.has(
+                        type.mime,
+                      ),
+                    })
+
+                    if (
+                      !type ||
+                      !DATASOURCE_CONFIG.SUPPORTED_IMAGE_TYPES.has(type.mime)
+                    ) {
+                      Logger.debug("Skipped image with unsupported MIME type", {
+                        imageName,
+                        detectedMime: type?.mime,
+                        supportedMimes: Array.from(
+                          DATASOURCE_CONFIG.SUPPORTED_IMAGE_TYPES,
+                        ),
+                      })
+                      Logger.warn(
+                        `Unsupported or unknown image MIME type: ${type?.mime}. Skipping image: ${imageName}`,
+                      )
+                      continue
+                    }
+
+                    Logger.debug(
+                      "All filters passed, proceeding with image extract + deferred description",
+                      {
+                        imageName,
+                      },
+                    )
+
+                    const imageHash = md5ImageBuffer(buffer)
+
+                    if (describeImages) {
+                      Logger.debug(
+                        "Scheduling deferred LLM description for image",
+                        {
+                          imageName,
+                        },
+                      )
+                    } else {
+                      Logger.debug(
+                        "Using default description (describeImages=false)",
+                      )
+                    }
+
+                    const ok = await commitPngImage(
+                      buffer,
+                      type,
+                      imageHash,
+                      String(imageName),
+                      pageNum,
+                      imagesOnPage,
+                    )
+                    if (ok) {
+                      Logger.debug(
+                        `Successfully processed image ${imageName} on page ${pageNum}`,
+                      )
+                    }
+                  }
+                } catch (error) {
+                  Logger.warn(
+                    `Failed to process image ${imageName} on page ${pageNum}: ${(error as Error).message}`,
+                  )
+                }
+              }
+              break
+            }
+            default:
+              break
+          }
+        }
+        // End of page: chunk the collected paragraphs.
+        const overlapText = processTextParagraphs(
+          paragraphs,
+          text_chunks,
+          text_chunk_pos,
+          text_chunks_map,
+          globalSeq,
+          pageNum,
+          hasPrevPageOverlap,
+        )
+
+        pageOverlap = overlapText.trim()
+
+        Logger.debug(
+          `Page ${pageNum} completed. Text operators found: ${textOperatorCount}, Current text chunks: ${text_chunks.length}, Current image chunks: ${image_chunks.length}`,
+        )
+      } finally {
+        page.cleanup()
+      }
+    }
+
+    await imageDescribeBatch.flushDescribeQueue(describeImages)
+    imageDescribeBatch.stripRejectedImageRows(
+      image_chunks,
+      image_chunk_pos,
+      imageSeqToHash,
+      image_chunks_map,
+    )
+    imageDescribeBatch.applyResolvedDescriptions(
+      image_chunks,
+      image_chunk_pos,
+      imageSeqToHash,
+    )
+
+    Logger.info(
+      `PDF processing completed. Total text chunks: ${text_chunks.length}, Total image chunks: ${image_chunks.length}`,
+    )
+
+    Logger.debug("PDF processing completed for document", { docid })
+    let documentOutline: string | undefined = undefined
+    try {
+      const outline = await pdfDocument.getOutline()
+      if (outline && outline.length > 0) {
+        // Resolve an outline item's destination to a 1-based page number.
+        const resolvePageNumber = async (
+          item: any,
+        ): Promise<number | undefined> => {
+          try {
+            let dest = item.dest
+            if (!dest) return undefined
+            // Named destinations (strings) must be resolved to an explicit dest array first.
+            if (typeof dest === "string") {
+              dest = await pdfDocument.getDestination(dest)
+            }
+            if (Array.isArray(dest) && dest.length > 0) {
+              const pageRef = dest[0]
+              if (pageRef && typeof pageRef === "object" && "num" in pageRef) {
+                const pageIndex = await pdfDocument.getPageIndex(pageRef)
+                return pageIndex + 1 // 0-indexed → 1-based
+              }
+            }
+          } catch {
+            // Ignore resolution failures for individual items.
+          }
+          return undefined
+        }
+
+        const formatOutline = async (
+          items: any[],
+          depth = 0,
+        ): Promise<string> => {
+          let result = ""
+          for (const item of items) {
+            const pageNum = await resolvePageNumber(item)
+            const pageSuffix = pageNum != null ? ` (Page ${pageNum})` : ""
+            result += "  ".repeat(depth) + "- " + item.title + pageSuffix + "\n"
+            if (item.items && item.items.length > 0) {
+              result += await formatOutline(item.items, depth + 1)
+            }
+          }
+          return result
+        }
+        documentOutline = await formatOutline(outline)
+        Logger.debug("Successfully extracted document outline natively.")
+      }
+    } catch (err) {
+      Logger.warn(
+        `Failed to extract document outline natively: ${(err as Error).message}`,
+      )
+    }
+
+    if (!documentOutline && text_chunks.length > 0) {
+      try {
+        Logger.info("Attempting to extract outline via LLM fallback...")
+        const { extractOutlineWithllm } = await import(
+          "@/platform/lib/extractOutlineWithLLM"
+        )
+        const joinedFrontMatter = text_chunks
+          .slice(0, Math.min(50, text_chunks.length))
+          .join("\n\n")
+        Logger.info(
+          `Passing ${joinedFrontMatter.slice(0, 50000).length} characters to extractOutlineWithllm`,
+        )
+        const llmOutline = await extractOutlineWithllm(
+          joinedFrontMatter.slice(0, 50000),
+        )
+        if (llmOutline) {
+          documentOutline = llmOutline
+          Logger.info("Successfully extracted outline via LLM.")
+        } else {
+          Logger.info("extractOutlineWithllm returned undefined or empty")
+        }
+      } catch (err) {
+        Logger.warn(
+          `Failed to extract outline via LLM: ${(err as Error).message}`,
+        )
+      }
+    }
+    Logger.debug("Processing summary", {
+      totalTextChunks: text_chunks.length,
+      totalImageChunks: image_chunks.length,
+      textChunkPositions: text_chunk_pos.length,
+      imageChunkPositions: image_chunk_pos.length,
+      extractImages,
+      describeImages,
+    })
+
+    Logger.debug("All text chunks", { text_chunks })
+    Logger.debug("All text chunks", { text_chunks })
+    Logger.debug("All text chunk positions", { text_chunk_pos })
+    Logger.debug("All image chunks", { image_chunks })
+    Logger.debug("All image chunk positions", { image_chunk_pos })
+    extractionSucceeded = true
+    return {
+      text_chunks,
+      image_chunks,
+      text_chunk_pos,
+      image_chunk_pos,
+      text_chunks_map,
+      image_chunks_map,
+      ...(documentOutline !== undefined && { documentOutline }),
+    }
+  } finally {
+    if (extractImages) {
+      await imageDescribeBatch.disposeTrackedImageFiles({
+        unlinkFiles: !extractionSucceeded,
+      })
+    }
+    Logger.debug("Calling PDF document destroy")
+    await pdfDocument.destroy()
+  }
+}

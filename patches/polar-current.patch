@@ -1,0 +1,4437 @@
+diff --git a/src/polar/gateway/engine.py b/src/polar/gateway/engine.py
+index b268f857..7231c416 100644
+--- a/src/polar/gateway/engine.py
++++ b/src/polar/gateway/engine.py
+@@ -31,6 +31,45 @@ from typing import Any
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Xyne/agent often omits max_tokens (JSON null). SGLang then runs unbounded
++# decode and wedges the scheduler (health OK, chat hangs, RTX2 ~0% util).
++# Hard ceiling: concurrent 8192-token gens fill mamba/max_running and hang.
++_DEFAULT_MAX_TOKENS = 16384
++_MAX_MAX_TOKENS = 16384
++
++
++def ensure_max_tokens(request: dict[str, Any], *, default: int = _DEFAULT_MAX_TOKENS) -> dict[str, Any]:
++    """Clamp missing/null/non-positive max_tokens so inference always terminates."""
++    mt = request.get("max_tokens")
++    if mt is None or mt == "":
++        mct = request.get("max_completion_tokens")
++        if mct not in (None, "") and int(mct) > 0:
++            request["max_tokens"] = int(mct)
++        else:
++            request["max_tokens"] = default
++            logger.info("inference max_tokens missing/null → default %s", default)
++    else:
++        try:
++            mt_i = int(mt)
++        except (TypeError, ValueError):
++            request["max_tokens"] = default
++            logger.info("inference max_tokens invalid %r → default %s", mt, default)
++        else:
++            if mt_i <= 0:
++                request["max_tokens"] = default
++                logger.info("inference max_tokens=%s → default %s", mt_i, default)
++            else:
++                request["max_tokens"] = mt_i
++    try:
++        capped = int(request["max_tokens"])
++    except (TypeError, ValueError, KeyError):
++        request["max_tokens"] = default
++        capped = default
++    if capped > _MAX_MAX_TOKENS:
++        logger.info("inference max_tokens=%s → hard cap %s", capped, _MAX_MAX_TOKENS)
++        request["max_tokens"] = _MAX_MAX_TOKENS
++    return request
++
+ 
+ class InferenceEngine(ABC):
+     """Strategy for one OpenAI-compatible inference backend.
+@@ -49,6 +88,7 @@ class InferenceEngine(ABC):
+         token-id flags) on top via ``super().prepare_request(...)``.
+         """
+         request["logprobs"] = True
++        ensure_max_tokens(request)
+         return request
+ 
+     def normalize_response(self, response: dict[str, Any]) -> dict[str, Any]:
+@@ -117,6 +157,7 @@ class SGLangEngine(InferenceEngine):
+ 
+     def prepare_request(self, request: dict[str, Any]) -> dict[str, Any]:
+         request = super().prepare_request(request)  # logprobs=True
++        request["top_logprobs"] = 1  # force SGLang to populate logprobs.content (token_id+logprob)
+         request["return_prompt_token_ids"] = True
+         request["return_meta_info"] = True
+         return request
+diff --git a/src/polar/gateway/node.py b/src/polar/gateway/node.py
+index 8485eb83..77db9d9d 100644
+--- a/src/polar/gateway/node.py
++++ b/src/polar/gateway/node.py
+@@ -89,6 +89,12 @@ class GatewayNodeManager:
+ 
+         self._rollout_server_url = rollout_server_url.rstrip("/") if rollout_server_url else None
+         self._heartbeat_interval_seconds = heartbeat_interval_seconds
++        # Independent wall-clock budget for evaluating a timed-out / partial
++        # trajectory. The shared session budget is usually exhausted by the time
++        # we reach eval on a timeout, so we give the evaluator its own window to
++        # still attach rewards (evaluate-on-timeout) instead of returning an
++        # unscored empty result.
++        self._harvest_eval_seconds = 1200.0
+         self._control_client: httpx.AsyncClient | None = None
+         self._heartbeat_task: asyncio.Task[None] | None = None
+ 
+@@ -507,21 +513,35 @@ class GatewayNodeManager:
+             return None
+ 
+     async def _acquire_prepared_eval_runtime(
+-        self, managed: ManagedSession
++        self, managed: ManagedSession, *, timeout: float
+     ) -> BaseRuntime | None:
+         """Await the prewarm task and return its runtime, if any."""
+         task = managed.eval_prewarm_task
+         if task is None:
+             return None
+         try:
+-            return await asyncio.wait_for(
+-                asyncio.shield(task), timeout=self._remaining_budget(managed)
+-            )
++            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+         except asyncio.TimeoutError as exc:
+             raise GatewayExecutionTimeout(
+                 "timed out waiting for a fresh evaluator runtime"
+             ) from exc
+ 
++    def _eval_timeout_seconds(
++        self, request: SessionDispatchRequest, managed: ManagedSession
++    ) -> float:
++        """Return the wall-clock budget for evaluating this session's trajectory.
++
++        Normally peers with the shared session execution budget. If that budget
++        is already exhausted (evaluating a timed-out partial trajectory), fall
++        back to a fixed generous window so rewards are still attached.
++        """
++        try:
++            return self._remaining_budget(managed)
++        except GatewayExecutionTimeout:
++            pass
++        configured = getattr(request, "timeout_seconds", None) or 0
++        return float(max(configured, self._harvest_eval_seconds))
++
+     async def _drain_eval_prewarm_task(
+         self, managed: ManagedSession
+     ) -> BaseRuntime | None:
+@@ -710,9 +730,12 @@ class GatewayNodeManager:
+         if live_runtime is None:
+             raise RuntimeError("runtime is required for evaluation")
+ 
++        eval_timeout = self._eval_timeout_seconds(request, managed)
+         fresh_eval_runtime: BaseRuntime | None = None
+         if evaluator_spec.refresh_runtime:
+-            fresh_eval_runtime = await self._acquire_prepared_eval_runtime(managed)
++            fresh_eval_runtime = await self._acquire_prepared_eval_runtime(
++                managed, timeout=eval_timeout
++            )
+             if fresh_eval_runtime is None:
+                 return trajectory.model_copy(
+                     update={
+@@ -729,7 +752,7 @@ class GatewayNodeManager:
+ 
+         try:
+             evaluator = self.evaluators.create(strategy_spec)
+-            eval_result = await self._await_with_budget(
++            eval_result = await asyncio.wait_for(
+                 evaluator.evaluate(
+                     trajectory,
+                     session_id=request.session_id,
+@@ -738,13 +761,13 @@ class GatewayNodeManager:
+                     artifacts_dir=managed.artifacts_dir,
+                     agent_result=agent_result,
+                     env=dict(evaluator_spec.env),
+-                    timeout_seconds=self._remaining_budget(managed),
++                    timeout_seconds=eval_timeout,
+                     runtime=live_runtime,
+                     fresh_eval_runtime=fresh_eval_runtime,
+                     runtime_spec=request.runtime or self.default_runtime,
+                     refresh_runtime=evaluator_spec.refresh_runtime,
+                 ),
+-                managed,
++                timeout=eval_timeout + 5,
+             )
+         except Exception as exc:
+             logger.exception(
+@@ -845,6 +868,10 @@ class GatewayNodeManager:
+     def _write_exec_log(
+         log_dir: Path, prefix: str, stdout: str | None, stderr: str | None
+     ) -> None:
++        # Defensive: under high concurrency the per-session logs/agent dir can
++        # be reaped while a (still-running) agent step returns. Ensure it exists
++        # so a valid step's logs still persist instead of raising ENOENT.
++        log_dir.mkdir(parents=True, exist_ok=True)
+         if stdout:
+             (log_dir / f"{prefix}.stdout.log").write_text(stdout)
+         if stderr:
+@@ -914,21 +941,39 @@ class GatewayNodeManager:
+         return self._error_result(request, timer, "session cancelled")
+ 
+     async def _push_result(self, callback_url: str | None, result: SessionResult) -> bool:
+-        """POST the terminal result to the rollout server. Return True on success."""
++        """POST the terminal result to the rollout server. Return True on success.
++
++        Retries with exponential backoff so a transient loopback hiccup on the
++        rollout server (:8081) does not silently drop the session result (which
++        previously came back as an empty trajectory and got the group dropped as
++        "zero trainable tokens"). Bounded to a few seconds so teardown is not
++        materially delayed.
++        """
+         if not callback_url:
+             return False
+-        try:
+-            response = await self._client.post(callback_url, json=result.model_dump(mode="json"))
+-            response.raise_for_status()
+-            return True
+-        except Exception:
+-            logger.warning(
+-                "Failed to deliver callback for session %s to %s",
+-                result.session_id,
+-                callback_url,
+-                exc_info=True,
+-            )
+-            return False
++        last_err: Exception | None = None
++        delay = 0.5
++        for attempt in range(1, 6):  # ~ up to 0.5+1+2+4 = 7.5s of retries
++            try:
++                response = await self._client.post(
++                    callback_url, json=result.model_dump(mode="json")
++                )
++                response.raise_for_status()
++                return True
++            except Exception as exc:
++                last_err = exc
++                if attempt < 5:
++                    logger.warning(
++                        "Retrying callback delivery for session %s to %s (attempt %s/5): %s",
++                        result.session_id, callback_url, attempt, exc,
++                    )
++                    await asyncio.sleep(delay)
++                    delay = min(delay * 2, 4.0)
++        logger.warning(
++            "Failed to deliver callback for session %s to %s after retries",
++            result.session_id, callback_url, exc_info=(last_err is not None),
++        )
++        return False
+ 
+     @staticmethod
+     def _snapshot_to_metrics(snapshot: DispatcherSnapshot) -> NodeStageMetrics:
+diff --git a/src/polar/gateway/proxy.py b/src/polar/gateway/proxy.py
+index 7b7ab333..c799e737 100644
+--- a/src/polar/gateway/proxy.py
++++ b/src/polar/gateway/proxy.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import logging
++import os
+ from typing import Any
+ 
+ import httpx
+@@ -18,6 +19,11 @@ from polar.gateway.engine import InferenceEngine
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Default concurrent chat/completions into SGLang. Override via
++# POLAR_MAX_INFLIGHT_GENERATIONS. Engine durability (cuda-graph off, max_running,
++# max_tokens cap) must absorb this concurrency — do not serialize to 1.
++_DEFAULT_MAX_INFLIGHT = 64
++
+ 
+ class UpstreamError(RuntimeError):
+     """Base class for upstream gateway failures."""
+@@ -65,7 +71,10 @@ class InferenceClient:
+     request params and canonicalizes responses.
+     """
+ 
+-    _LIVENESS_TIMEOUT_SECONDS = 900.0
++    # Liveness must exceed healthy slow generations under max_inflight=64.
++    # A 90s ceiling timed out live decodes and then soft-unwedged mid-flight,
++    # which repeatedly empty_cache'd busy engines and killed them.
++    _LIVENESS_TIMEOUT_SECONDS = float(os.environ.get("POLAR_INFERENCE_LIVENESS_TIMEOUT", "7200"))
+ 
+     def __init__(self, base_url: str, engine: InferenceEngine):
+         self.base_url = base_url.rstrip("/")
+@@ -74,6 +83,31 @@ class InferenceClient:
+         self._generation_paused = False
+         self._inflight_generations = 0
+         self._generation_condition = asyncio.Condition()
++        self._last_soft_unwedge_mono = 0.0
++        self._soft_unwedge_lock = asyncio.Lock()
++        self._wedge_monitor_task: asyncio.Task[None] | None = None
++        try:
++            self._max_inflight_generations = max(
++                1, int(os.environ.get("POLAR_MAX_INFLIGHT_GENERATIONS", str(_DEFAULT_MAX_INFLIGHT)))
++            )
++        except (TypeError, ValueError):
++            self._max_inflight_generations = _DEFAULT_MAX_INFLIGHT
++        raw_engines = os.environ.get("POLAR_SGLANG_ENGINE_URLS", "").strip()
++        # When unset, probe the SAME engine this client serves (base_url) rather
++        # than stale RTX2 ports, so wedge health checks are coherent. Auto-unwedge
++        # itself is gated off by default (see start_wedge_monitor).
++        if not raw_engines:
++            raw_engines = self.base_url
++        self._engine_abort_urls = [
++            u.strip().rstrip("/") for u in raw_engines.split(",") if u.strip()
++        ]
++        logger.info(
++            "InferenceClient max_inflight_generations=%s liveness_timeout=%.0fs abort_engines=%s (base_url=%s)",
++            self._max_inflight_generations,
++            self._LIVENESS_TIMEOUT_SECONDS,
++            self._engine_abort_urls or "(none)",
++            self.base_url,
++        )
+ 
+     async def _get_client(self) -> httpx.AsyncClient:
+         if self._client is None or self._client.is_closed:
+@@ -113,6 +147,11 @@ class InferenceClient:
+ 
+     async def completion(self, request: dict[str, Any]) -> dict[str, Any]:
+         """Non-streaming chat completion. Returns the full JSON response."""
++        import time as _t
++        _st=_t.monotonic()
++        _m=request.get('model')
++        _mt=request.get('max_tokens')
++        print(f'[GWINST-completion-start] model={_m} max_tokens={_mt} inflight={self._inflight_generations} paused={self._generation_paused}', flush=True)
+         await self._acquire_generation_slot()
+         client = await self._get_client()
+         from copy import deepcopy
+@@ -127,17 +166,182 @@ class InferenceClient:
+                 json=request_copy,
+                 headers={"Content-Type": "application/json"},
+             )
++        except httpx.TimeoutException as exc:
++            # Do NOT abort_all here (KeyError rid races under max_inflight=64).
++            # Soft-nudge continue_generation so a wedged scheduler can recover
++            # instead of holding util≈0 forever while Polar recycles dead slots.
++            logger.warning(
++                "Upstream chat timed out after %.0fs (inflight≈%s); soft-unwedge + release slot",
++                self._LIVENESS_TIMEOUT_SECONDS,
++                self._inflight_generations,
++            )
++            await self._abort_engine_orphans(reason="httpx_timeout")
++            raise self._translate_transport_error(exc) from exc
+         except httpx.RequestError as exc:
+             raise self._translate_transport_error(exc) from exc
+         finally:
+             await self._release_generation_slot()
+ 
+         await self._raise_for_status(resp)
++        print(f'[GWINST-completion-DONE] model={_m} elapsed={_t.monotonic()-_st:.1f}s', flush=True)
+         return self.engine.normalize_response(resp.json())
+ 
++    @staticmethod
++    def _parse_sglang_runtime_metrics(text: str) -> tuple[float, float, float]:
++        """Parse running/queued/throughput gauges from SGLang Prometheus text.
++
++        ``/server_info`` often omits runtime fields, so a probe that only reads
++        JSON always sees idle engines and soft-unwedges mid-decode.
++        """
++        running = queued = thr = 0.0
++        for line in text.splitlines():
++            if line.startswith("#") or " " not in line:
++                continue
++            name, _, rest = line.partition(" ")
++            # Strip prometheus labels: metric{...} value
++            metric = name.split("{", 1)[0]
++            try:
++                value = float(rest.strip().split()[0])
++            except (TypeError, ValueError, IndexError):
++                continue
++            if metric == "sglang:num_running_reqs":
++                running = max(running, value)
++            elif metric == "sglang:num_queue_reqs":
++                queued = max(queued, value)
++            elif metric == "sglang:gen_throughput":
++                thr = max(thr, value)
++        return running, queued, thr
++
++    async def _engines_look_wedged(self, client: httpx.AsyncClient) -> bool:
++        """True when engines look idle/stuck OR scheduler-starved (queue ≫ running)."""
++        busy = 0
++        probed = 0
++        starved = 0
++        for url in self._engine_abort_urls:
++            try:
++                # Prefer /metrics — /server_info lacks num_running_reqs etc.
++                resp = await client.get(f"{url}/metrics")
++                if resp.status_code != 200:
++                    resp = await client.get(f"{url}/server_info")
++                    if resp.status_code != 200:
++                        continue
++                    info = resp.json()
++                    probed += 1
++                    running = float(info.get("num_running_reqs") or 0)
++                    queued = float(info.get("num_queue_reqs") or 0)
++                    thr = float(info.get("gen_throughput") or 0.0)
++                else:
++                    probed += 1
++                    running, queued, thr = self._parse_sglang_runtime_metrics(resp.text)
++                # Healthy parallel decode: many running OR high throughput.
++                if running > 0 or queued > 0 or thr > 1.0:
++                    busy += 1
++                # Scheduler wedge: deep queue but almost no active decodes.
++                if queued >= 8 and running <= 4 and thr < 120.0:
++                    starved += 1
++            except Exception:
++                continue
++        if probed == 0:
++            return False
++        if starved > 0:
++            return True
++        return busy == 0
++
++    async def start_wedge_monitor(self, interval_seconds: float = 30.0) -> None:
++        """Background probe: unwedge when gateway holds slots but engines look idle.
++
++        DISABLED by default. Under deep-queue rollout load (inflight == max) the
++        old 'starved' heuristic misfires and soft-unwedged live long agentic tool
++        generations (engine finish_reason=abort, prompt=0, completion=0 == empty
++        traces, zero rewards). Set POLAR_ENABLE_AUTO_UNWEDGE=1 to re-enable.
++        """
++        if os.environ.get("POLAR_ENABLE_AUTO_UNWEDGE", "0") != "1":
++            return
++        if self._wedge_monitor_task is not None:
++            return
++
++        async def _loop() -> None:
++            while True:
++                await asyncio.sleep(interval_seconds)
++                if self._generation_paused or self._inflight_generations == 0:
++                    continue
++                try:
++                    async with httpx.AsyncClient(
++                        timeout=httpx.Timeout(10.0, connect=5.0)
++                    ) as client:
++                        wedged = await self._engines_look_wedged(client)
++                except Exception:
++                    continue
++                if wedged:
++                    logger.warning(
++                        "Background wedge probe: inflight=%s but engines idle/stuck; soft-unwedge",
++                        self._inflight_generations,
++                    )
++                    await self._abort_engine_orphans(reason="scheduler_starved")
++
++        self._wedge_monitor_task = asyncio.create_task(_loop())
++
++    async def stop_wedge_monitor(self) -> None:
++        task = self._wedge_monitor_task
++        self._wedge_monitor_task = None
++        if task is None:
++            return
++        task.cancel()
++        try:
++            await task
++        except asyncio.CancelledError:
++            pass
++
++    async def _abort_engine_orphans(self, *, reason: str) -> None:
++        """Debounced soft unwedge: continue_generation only when engines look wedged."""
++        if not self._engine_abort_urls:
++            return
++        import time as _time
++
++        async with self._soft_unwedge_lock:
++            now = _time.monotonic()
++            if now - self._last_soft_unwedge_mono < 60.0:
++                return
++            self._last_soft_unwedge_mono = now
++        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
++            try:
++                wedged = await self._engines_look_wedged(client)
++            except Exception as exc:
++                logger.warning("Engine wedge probe failed (%s); skip soft-unwedge", exc)
++                return
++            if not wedged:
++                logger.warning(
++                    "Upstream timeout (%s) but engines still decoding; skip soft-unwedge",
++                    reason,
++                )
++                return
++            logger.warning(
++                "Soft-unwedging SGLang engines via continue_generation (reason=%s urls=%s)",
++                reason,
++                self._engine_abort_urls,
++            )
++            for url in self._engine_abort_urls:
++                try:
++                    # Soft nudge ONLY. Do NOT abort_all in-flight requests here:
++                    # under a slow-but-active engine (deep queue, low throughput)
++                    # this wedge heuristic misfired and killed every long agentic
++                    # generation every 60s, zeroing rewards. Keep the scheduler
++                    # moving via continue_generation; a genuinely wedged engine is
++                    # recovered elsewhere (trainer pause) rather than by nuking live reqs.
++                    await client.post(
++                        f"{url}/continue_generation",
++                        json={},
++                        headers={"Content-Type": "application/json"},
++                    )
++                except Exception as exc:
++                    logger.warning("continue_generation failed for %s: %s", url, exc)
++
+     async def _acquire_generation_slot(self) -> None:
+         async with self._generation_condition:
+-            await self._generation_condition.wait_for(lambda: not self._generation_paused)
++            await self._generation_condition.wait_for(
++                lambda: (not self._generation_paused)
++                and self._inflight_generations < self._max_inflight_generations
++            )
+             self._inflight_generations += 1
+ 
+     async def _release_generation_slot(self) -> None:
+@@ -146,15 +350,38 @@ class InferenceClient:
+             self._generation_condition.notify_all()
+ 
+     async def pause_generation(self, *, timeout_seconds: float = 300.0) -> dict[str, Any]:
+-        """Block new generation requests and wait for current inference calls to drain."""
++        """Block new generation requests and wait for current inference calls to drain.
++
++        On drain timeout, keep ``paused=True`` and drop the shared httpx client so
++        hung upstream POSTs fail fast and release ``_inflight_generations``. Miles
++        then aborts SGLang engines; without this cancel, drain never completes and
++        Polar keeps holding dead slots against a wedged scheduler.
++        """
++        client_to_close = None
++        timed_out = False
+         async with self._generation_condition:
+             self._generation_paused = True
+             self._generation_condition.notify_all()
+-            await asyncio.wait_for(
+-                self._generation_condition.wait_for(lambda: self._inflight_generations == 0),
+-                timeout=timeout_seconds,
++            try:
++                await asyncio.wait_for(
++                    self._generation_condition.wait_for(lambda: self._inflight_generations == 0),
++                    timeout=timeout_seconds,
++                )
++            except TimeoutError:
++                # Close outside the lock: completion finally → _release_generation_slot
++                # needs this same condition.
++                client_to_close = self._client
++                self._client = None
++                timed_out = True
++            else:
++                return self.generation_status()
++        if timed_out:
++            if client_to_close is not None and not client_to_close.is_closed:
++                await client_to_close.aclose()
++            raise TimeoutError(
++                f"Timed out waiting for inference requests to drain after {timeout_seconds}s"
+             )
+-            return self.generation_status()
++        return self.generation_status()
+ 
+     async def resume_generation(self) -> dict[str, Any]:
+         async with self._generation_condition:
+@@ -166,6 +393,7 @@ class InferenceClient:
+         return {
+             "paused": self._generation_paused,
+             "inflight": self._inflight_generations,
++            "max_inflight": self._max_inflight_generations,
+             "base_url": self.base_url,
+             "engine": self.engine.name,
+         }
+@@ -202,5 +430,6 @@ class InferenceClient:
+             return {"status": "ok", "body": text}
+ 
+     async def close(self):
++        await self.stop_wedge_monitor()
+         if self._client and not self._client.is_closed:
+             await self._client.aclose()
+diff --git a/src/polar/gateway/server.py b/src/polar/gateway/server.py
+index 1bc9466e..cd6d7a6f 100644
+--- a/src/polar/gateway/server.py
++++ b/src/polar/gateway/server.py
+@@ -111,6 +111,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
+         default_runtime=node.default_runtime,
+         rollout_server_url=topology.gateway.rollout_server_url or None,
+         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
++        session_base_dir=os.environ.get("POLAR_SESSION_BASE_DIR"),
+     )
+     return GatewayState(
+         topology=topology,
+@@ -184,9 +185,11 @@ async def _lifespan(_: FastAPI):
+     state = get_state()
+     await state.completion_writer.start()
+     await state.node_manager.start()
++    await state.inference.start_wedge_monitor()
+     try:
+         yield
+     finally:
++        await state.inference.stop_wedge_monitor()
+         await state.node_manager.close()
+         await state.inference.close()
+         state.storage.close()
+@@ -396,6 +399,31 @@ def format_stream_output(
+     return _format_openai_sse(transformed)
+ 
+ 
++
++
++def _sanitize_tool_schemas(req):
++    """Neutralize cyclic tool ``parameters`` schemas (the xyne harness emits a
++    self-referential ``filters`` schema that serializes as the literal string
++    ``[REDACTED:cycle]``). SGLang's JSON-schema validator rejects that string,
++    which makes every agentic chat completion fail with "invalid 'parameters'
++    schema" before any token is generated. Replace the redacted cycle marker
++    with a permissive empty schema so the request passes through."""
++    tools = req.get("tools")
++    if not tools:
++        return req
++
++    def clean(x):
++        if isinstance(x, dict):
++            return {k: clean(v) for k, v in x.items()}
++        if isinstance(x, list):
++            return [clean(v) for v in x]
++        if x == "[REDACTED:cycle]":
++            return {}
++        return x
++
++    req["tools"] = [clean(t) for t in tools]
++    return req
++
+ @app.get("/v1/models")
+ async def list_models():
+     state = get_state()
+@@ -645,6 +673,7 @@ async def proxy_request(request: Request, path: str):
+     transformed_body["_polar_model_served"] = state.node.model_served
+     openai_request = transformer.transform_request(transformed_body)
+     openai_request["model"] = state.node.model_served
++    openai_request = _sanitize_tool_schemas(openai_request)
+     is_streaming = openai_request.get("stream", False)
+ 
+     if is_streaming:
+@@ -679,11 +708,14 @@ async def _handle_non_streaming(
+     session_info: Any | None,
+ ) -> JSONResponse:
+     state = get_state()
++    import time as _t
++    _st=_t.monotonic()
+     try:
+         response = await state.inference.completion(openai_request)
+     except UpstreamError as exc:
+-        logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
++        logger.warning("[GWINST-nonstream-ERR] session=%s model=%s err=%s el=%ss", session_id, openai_request.get('model'), exc, round(_t.monotonic()-_st,1))
+         return _upstream_error_response(api_type, exc)
++    logger.info("[GWINST-nonstream-DONE] session=%s task=%s model=%s el=%ss", session_id, session_info.task_id if session_info else None, openai_request.get('model'), round(_t.monotonic()-_st,1))
+ 
+     state.storage.save_message(
+         session_id,
+diff --git a/src/polar/rollout/manager.py b/src/polar/rollout/manager.py
+index 1d8b7bae..ebeca993 100644
+--- a/src/polar/rollout/manager.py
++++ b/src/polar/rollout/manager.py
+@@ -14,6 +14,7 @@ import httpx
+ 
+ from polar.platform.events import EventBus
+ from polar.rollout.balancer import NodeScheduler
++from polar.rollout.group_reward import apply_group_reward
+ from polar.rollout.models import (
+     SessionContext,
+     SessionResult,
+@@ -241,7 +242,7 @@ class RolloutManager:
+                 self._tasks[request.task_id].updated_at = time.time()
+             raise
+ 
+-        ordered_results = list(results)
++        ordered_results = apply_group_reward(list(results), request.group_reward)
+         with self._lock:
+             record = self._tasks[request.task_id]
+             record.status = "completed"
+@@ -260,16 +261,54 @@ class RolloutManager:
+     def get_task(self, task_id: str) -> TaskStatus | None:
+         with self._lock:
+             record = self._tasks.get(task_id)
+-            if record is None:
+-                return None
+-            return TaskStatus(
+-                task_id=record.task_id,
+-                status=record.status,
+-                total_sessions=record.total_sessions,
+-                completed_sessions=record.completed_sessions,
+-                results=list(record.results),
+-                result_paths=list(record.result_paths),
++            if record is not None:
++                return TaskStatus(
++                    task_id=record.task_id,
++                    status=record.status,
++                    total_sessions=record.total_sessions,
++                    completed_sessions=record.completed_sessions,
++                    results=list(record.results),
++                    result_paths=list(record.result_paths),
++                )
++        # In-memory miss (e.g. rollout server restarted): recover completed
++        # sessions from save_dir so Miles polling does not 404-drop groups.
++        persisted = self.pipeline.load_persisted_task_results(task_id)
++        if persisted is None:
++            return None
++        results, result_paths = persisted
++        with self._lock:
++            # Another submit may have re-created the task while we loaded disk.
++            record = self._tasks.get(task_id)
++            if record is not None:
++                return TaskStatus(
++                    task_id=record.task_id,
++                    status=record.status,
++                    total_sessions=record.total_sessions,
++                    completed_sessions=record.completed_sessions,
++                    results=list(record.results),
++                    result_paths=list(record.result_paths),
++                )
++            self._tasks[task_id] = _TaskRecord(
++                task_id=task_id,
++                status="completed",
++                total_sessions=len(results),
++                completed_sessions=len(results),
++                results=list(results),
++                result_paths=list(result_paths),
+             )
++        logger.info(
++            "Restored task %s from disk (%d sessions) after in-memory miss",
++            task_id,
++            len(results),
++        )
++        return TaskStatus(
++            task_id=task_id,
++            status="completed",
++            total_sessions=len(results),
++            completed_sessions=len(results),
++            results=list(results),
++            result_paths=list(result_paths),
++        )
+ 
+     def list_tasks(self) -> list[dict[str, Any]]:
+         with self._lock:
+diff --git a/src/polar/rollout/models.py b/src/polar/rollout/models.py
+index 8dea689e..42730841 100644
+--- a/src/polar/rollout/models.py
++++ b/src/polar/rollout/models.py
+@@ -7,7 +7,7 @@ import time
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from enum import StrEnum
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Literal
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+@@ -56,6 +56,20 @@ def _default_builder_spec() -> StrategySpec:
+     return StrategySpec(strategy="per_request")
+ 
+ 
++class GroupRewardSpec(BaseModel):
++    """Optional task-level shaping applied after every rollout peer finishes."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    strategy: Literal[
++        "quality_conditioned_token_efficiency",
++        "mutual_information_evidence",
++        "best_answer_and_mi",
++    ] = "quality_conditioned_token_efficiency"
++    weight: float = Field(default=0.0, ge=0.0)
++    input_weight: float = Field(default=0.0, ge=0.0)
++
++
+ class TaskRequest(BaseModel):
+     """Task submitted by the trainer."""
+ 
+@@ -67,6 +81,7 @@ class TaskRequest(BaseModel):
+     agent: AgentSpec
+     builder: StrategySpec = Field(default_factory=_default_builder_spec)
+     evaluator: EvaluatorSpec | None = None
++    group_reward: GroupRewardSpec | None = None
+     callback_url: str | None = None
+     metadata: dict[str, object] = Field(default_factory=dict)
+ 
+diff --git a/src/polar/rollout/pipeline.py b/src/polar/rollout/pipeline.py
+index 2128bcfc..bf853a62 100644
+--- a/src/polar/rollout/pipeline.py
++++ b/src/polar/rollout/pipeline.py
+@@ -49,6 +49,7 @@ class Pipeline:
+         scheduler: NodeScheduler,
+         dispatch_poll_interval_seconds: float = 1.0,
+         callback_grace_seconds: float = 180.0,
++        harvest_grace_seconds: float = 2700.0,
+         event_bus: EventBus | None = None,
+     ) -> None:
+         self.callback_url = callback_url.rstrip("/")
+@@ -56,6 +57,7 @@ class Pipeline:
+         self.scheduler = scheduler
+         self.dispatch_poll_interval_seconds = dispatch_poll_interval_seconds
+         self.callback_grace_seconds = callback_grace_seconds
++        self.harvest_grace_seconds = harvest_grace_seconds
+         self.event_bus = event_bus
+ 
+         self._client: httpx.AsyncClient | None = None
+@@ -132,6 +134,46 @@ class Pipeline:
+         path = self._result_path(task_id, session_id)
+         return None if path is None else str(path)
+ 
++    def load_persisted_task_results(
++        self, task_id: str
++    ) -> tuple[list[SessionResult], list[str]] | None:
++        """Reload completed session artifacts for a task after process restart.
++
++        Polar keeps ``_tasks`` in memory only; Miles falls back to GET polling
++        when callbacks fail. After a rollout-server restart, serve completed
++        results from ``save_dir`` so trainers do not see spurious 404 drops.
++        """
++        if self.save_dir is None:
++            return None
++        task_dir = self.save_dir / f"task_{task_id}"
++        if not task_dir.is_dir():
++            return None
++        results: list[SessionResult] = []
++        paths: list[str] = []
++        for path in sorted(task_dir.glob("ses_*.json")):
++            try:
++                payload = json.loads(path.read_text())
++                # On-disk shape strips trajectory.status/error (see _storage_payload);
++                # restore from session-level fields so SessionResult validates.
++                traj = payload.get("trajectory")
++                if isinstance(traj, dict):
++                    if "status" not in traj:
++                        traj["status"] = payload.get("status") or SessionStatus.COMPLETED
++                    if "error" not in traj and payload.get("error") is not None:
++                        traj["error"] = payload.get("error")
++                results.append(SessionResult.model_validate(payload))
++                paths.append(str(path))
++            except Exception:
++                logger.warning(
++                    "Failed to load persisted session result %s for task %s",
++                    path,
++                    task_id,
++                    exc_info=True,
++                )
++        if not results:
++            return None
++        return results, paths
++
+     async def _dispatch_and_collect(
+         self,
+         session: SessionContext,
+@@ -151,6 +193,7 @@ class Pipeline:
+             "session.state_changed",
+             {"task_id": session.task_id, "session_id": session.session_id, "status": "DISPATCHING"},
+         )
++        dispatch_request = None
+         try:
+             dispatch_request = await self._dispatch_session(session)
+             session.timer.mark("dispatch", "finished")
+@@ -167,11 +210,17 @@ class Pipeline:
+         except TimeoutError as exc:
+             logger.warning(
+                 "Session %s did not return a result before the result timeout; "
+-                "auto-failing the group member with reward 0 (%s)",
++                "harvesting any partial result before auto-failing (%s)",
+                 session.session_id,
+                 exc,
+             )
+-            result = self._result_timeout_result(session, error=str(exc))
++            result = await self._harvest_on_timeout(session, dispatch_request, future)
++            if result is None:
++                logger.info(
++                    "No harvestable partial result for session %s; auto-failing member",
++                    session.session_id,
++                )
++                result = self._result_timeout_result(session, error=str(exc))
+         except Exception as exc:
+             logger.exception("Dispatch failed for session %s", session.session_id)
+             result = self._failure_result(session, error=str(exc))
+@@ -376,6 +425,49 @@ class Pipeline:
+             f"before the result timeout ({self._result_timeout_seconds(session)}s)"
+         )
+ 
++    async def _harvest_on_timeout(
++        self,
++        session: SessionContext,
++        dispatch_request: SessionDispatchRequest,
++        future: asyncio.Future[SessionResult],
++    ) -> SessionResult | None:
++        """Best-effort collect of a partial/final result after the strict deadline.
++
++        The gateway may still be building/evaluating the partial trajectory when
++        the session result timeout fires. Rather than discarding that work as an
++        empty timeout auto-fail, keep polling the gateway for up to
++        ``harvest_grace_seconds`` to collect whatever it produced (so the reward
++        function is applied to the partial and the group is not dropped). Returns
++        ``None`` if nothing usable arrives before the harvest window closes.
++        """
++        deadline = time.monotonic() + max(
++            self.harvest_grace_seconds, self.callback_grace_seconds
++        )
++        interval = max(3.0, min(self.dispatch_poll_interval_seconds, 5.0))
++        while time.monotonic() < deadline:
++            if self._client is None:
++                break
++            try:
++                _, result = await self._poll_session_state(session, timeout=30.0)
++                if result is not None and (result.trajectory.traces or result.error):
++                    return result
++            except Exception:
++                logger.debug(
++                    "harvest poll failed for session %s", session.session_id, exc_info=True
++                )
++            if future.done():
++                try:
++                    return future.result()
++                except Exception:
++                    return None
++            await asyncio.sleep(interval)
++        if future.done():
++            try:
++                return future.result()
++            except Exception:
++                pass
++        return None
++
+     async def _poll_session_state(
+         self,
+         session: SessionContext,
+@@ -535,12 +627,12 @@ class Pipeline:
+             "task_metadata": dict(session.request.metadata),
+         }
+         trace = Trace(
+-            prompt_ids=[],
+-            response_ids=[],
+-            loss_mask=[],
++            prompt_ids=[0],
++            response_ids=[0],
++            loss_mask=[0],
+             response_logprobs=None,
+             reward=0.0,
+-            metadata={"result_timeout": True},
++            metadata={"result_timeout": True, "placeholder": True},
+         )
+         return SessionResult(
+             session_id=session.session_id,
+diff --git a/src/polar/trajectory/builder/record_utils.py b/src/polar/trajectory/builder/record_utils.py
+index a765c289..59f8f38e 100644
+--- a/src/polar/trajectory/builder/record_utils.py
++++ b/src/polar/trajectory/builder/record_utils.py
+@@ -122,6 +122,81 @@ def _extract_tools(request: dict[str, Any]) -> list[dict[str, Any]] | None:
+     return extracted or None
+ 
+ 
++
++
++# --- Tokenizer fallback (engine-omitted token ids) ---------------------------
++_FALLBACK_TOKENIZER = None
++_FALLBACK_TOKENIZER_PATH = "/data/siraj/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
++_EOT_TOKEN_ID = 11
++
++
++def _get_fallback_tokenizer():
++    global _FALLBACK_TOKENIZER
++    if _FALLBACK_TOKENIZER is not None:
++        return _FALLBACK_TOKENIZER
++    try:
++        import inspect
++        if not hasattr(inspect, "signature"):
++            import importlib
++            importlib.reload(inspect)
++        from transformers import AutoTokenizer
++        _FALLBACK_TOKENIZER = AutoTokenizer.from_pretrained(
++            _FALLBACK_TOKENIZER_PATH, trust_remote_code=True
++        )
++    except Exception as exc:
++        logger.warning("tokenizer fallback unavailable: %s", exc)
++        _FALLBACK_TOKENIZER = False
++    return _FALLBACK_TOKENIZER
++
++
++def _fallback_prompt_ids(request):
++    tok = _get_fallback_tokenizer()
++    if not tok:
++        return []
++    messages = request.get("messages")
++    if not isinstance(messages, list) or not messages:
++        return []
++    try:
++        text = tok.apply_chat_template(
++            messages, tokenize=False, add_generation_prompt=True, tools=request.get("tools")
++        )
++        if isinstance(text, str):
++            return tok(text, add_special_tokens=False)["input_ids"]
++    except Exception:
++        pass
++    return []
++
++
++def _fallback_response_tokens(message):
++    tok = _get_fallback_tokenizer()
++    if not tok:
++        return [], None
++    parts = []
++    content = message.get("content")
++    if content:
++        if isinstance(content, str):
++            parts.append(content)
++        elif isinstance(content, list):
++            for item in content:
++                if isinstance(item, dict) and isinstance(item.get("text"), str):
++                    parts.append(item["text"])
++    for tc in (message.get("tool_calls") or []):
++        fn = tc.get("function") if isinstance(tc, dict) else None
++        if not isinstance(fn, dict):
++            continue
++        args = fn.get("arguments")
++        if isinstance(args, str):
++            parts.append(args)
++    text = "".join(parts)
++    try:
++        ids = tok(text, add_special_tokens=False)["input_ids"]
++    except Exception:
++        return [], None
++    if ids and ids[-1] != _EOT_TOKEN_ID:
++        ids = ids + [_EOT_TOKEN_ID]
++    return ids, [0.0] * len(ids)
++
++
+ def build_trace_from_completion(completion: CompletionRecord) -> Trace:
+     """Normalize one stored completion record into a trajectory trace."""
+ 
+@@ -143,8 +218,14 @@ def build_trace_from_completion(completion: CompletionRecord) -> Trace:
+ 
+     response_ids, response_logprobs = _extract_response_tokens(response, first_choice)
+ 
++    prompt_id_list = list(prompt_ids) if isinstance(prompt_ids, list) else []
++    if not prompt_id_list:
++        prompt_id_list = _fallback_prompt_ids(request)
++    if not response_ids and isinstance(response_message, dict):
++        response_ids, response_logprobs = _fallback_response_tokens(response_message)
++
+     return Trace(
+-        prompt_ids=list(prompt_ids) if isinstance(prompt_ids, list) else [],
++        prompt_ids=prompt_id_list,
+         response_ids=response_ids,
+         loss_mask=[1] * len(response_ids),
+         prompt_messages=_extract_prompt_messages(request),
+diff --git a/src/polar/xyne/evaluator.py b/src/polar/xyne/evaluator.py
+index a60008be..65d2a56f 100644
+--- a/src/polar/xyne/evaluator.py
++++ b/src/polar/xyne/evaluator.py
+@@ -76,6 +76,9 @@ metadata bounded: this evaluator caps the lengths of the potentially huge
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import logging
++import os
+ from typing import Any
+ 
+ from polar.trajectory.evaluator.base import BaseTrajectoryEvaluator
+@@ -91,6 +94,8 @@ from polar.xyne.types import XyneRawFlow
+ 
+ __all__ = ["XyneCompositeEvaluator"]
+ 
++logger = logging.getLogger(__name__)
++
+ # Length caps for trimming raw-flow metadata before attaching to EvalResult.
+ _MAX_DEBUG_EVENTS = 100
+ _MAX_NESTED_RUNS = 100
+@@ -131,6 +136,38 @@ def _parse_raw(raw: Any) -> XyneRawFlow:
+     raise ValueError("xyne_raw must be a dict or JSON string")
+ 
+ 
++def _detect_incomplete_agentic(flow: XyneRawFlow) -> str | None:
++    """Detect stopReason=toolUse with no executed/persisted tools.
++
++    Gateway completions often show ``finish_reason=tool_calls`` while the
++    Xyne ``/dump`` has empty ``toolCalls`` and only a planning stub answer.
++    Those turns must not earn completion/format/efficiency baseline reward.
++    """
++    meta = flow.metadata if isinstance(flow.metadata, dict) else {}
++    marked = meta.get("incomplete_agentic")
++    if isinstance(marked, str) and marked.strip():
++        return marked.strip()
++    if flow.tool_calls or flow.tool_use_blocks:
++        return None
++    stop: str | None = None
++    if isinstance(flow.finish_reason, str) and flow.finish_reason.strip():
++        stop = flow.finish_reason.strip()
++    for event in flow.debug_events or []:
++        if not isinstance(event, dict):
++            continue
++        raw = event.get("stopReason") or event.get("finish_reason")
++        if isinstance(raw, str) and raw.strip():
++            stop = raw.strip()
++    if not stop:
++        return None
++    normalized = stop.replace("_", "").casefold()
++    if normalized in {"tooluse", "toolcalls"}:
++        return (
++            f"incomplete agentic: stopReason={stop} but toolCalls empty"
++        )
++    return None
++
++
+ def _normalize_judge(judge: Any) -> dict[str, Any]:
+     """Normalize a user-facing ``judge`` dict to llm_judge scorer config keys."""
+     if not isinstance(judge, dict):
+@@ -145,9 +182,28 @@ def _normalize_judge(judge: Any) -> dict[str, Any]:
+     # Pass through any explicitly-named judge config keys (e.g. _transport,
+     # prompt_template, timeout) that callers may set directly.
+     for key in ("judge_base_url", "judge_api_key", "judge_model", "prompt_template",
+-                "timeout", "_transport"):
+-        if key in judge:
++                "timeout", "_transport", "dimension_weights", "max_concurrency",
++                "max_tokens"):
++        if key not in judge:
++            continue
++        # envsubst of unset XYNE_JUDGE_MAX_* leaves YAML null; skip so
++        # llm_judge can apply its documented defaults.
++        if key in ("max_tokens", "max_concurrency") and judge[key] in (None, ""):
++            continue
++        cfg[key] = judge[key]
++    # Pass through any per-dimension enable toggles (enable_quality,
++    # enable_correctness, ...) verbatim, so the llm_judge scorer can read them.
++    for key in judge:
++        if str(key).startswith("enable_"):
+             cfg[key] = judge[key]
++    # The gateway can point judge traffic at its colocated inference router
++    # without requiring trainer-specific config changes.
++    if base_url := os.environ.get("POLAR_XYNE_JUDGE_BASE_URL"):
++        cfg["judge_base_url"] = base_url
++    if model := os.environ.get("POLAR_XYNE_JUDGE_MODEL"):
++        cfg["judge_model"] = model
++    if api_key := os.environ.get("POLAR_XYNE_JUDGE_API_KEY"):
++        cfg["judge_api_key"] = api_key
+     return cfg
+ 
+ 
+@@ -163,6 +219,8 @@ def _build_pipeline(config: dict[str, Any]) -> RewardPipeline:
+     """
+     parsed: XyneRewardConfig = XyneRewardConfig.from_dict(config)
+     top_expected = config.get("expected_doc_ids")
++    top_expected_chunks = config.get("expected_chunk_ids")
++    top_reference = config.get("reference_answer")
+     top_judge = _normalize_judge(config.get("judge"))
+ 
+     # Raw per-scorer entries (unedited) keyed by name for lookup.
+@@ -186,6 +244,8 @@ def _build_pipeline(config: dict[str, Any]) -> RewardPipeline:
+                 weight=scorer_cfg.weight,
+                 enabled=scorer_cfg.enabled,
+                 top_expected=top_expected,
++                top_expected_chunks=top_expected_chunks,
++                top_reference=top_reference,
+                 top_judge=top_judge,
+                 entry=raw_entries.get(scorer_cfg.name, {}),
+             )
+@@ -200,6 +260,8 @@ def _instantiate_scorer(
+     weight: float,
+     enabled: bool,
+     top_expected: Any,
++    top_expected_chunks: Any,
++    top_reference: Any,
+     top_judge: dict[str, Any],
+     entry: dict[str, Any],
+ ) -> XyneScorer:
+@@ -211,13 +273,50 @@ def _instantiate_scorer(
+         if expected is not None:
+             per_scorer["expected_doc_ids"] = expected
+ 
++    if name in {
++        "gold_evidence_coverage",
++        "citation_evidence_coverage",
++        "tool_evidence_utility",
++    }:
++        expected = entry.get("expected_doc_ids", top_expected)
++        expected_chunks = entry.get("expected_chunk_ids", top_expected_chunks)
++        if expected is not None:
++            per_scorer["expected_doc_ids"] = expected
++        if expected_chunks is not None:
++            per_scorer["expected_chunk_ids"] = expected_chunks
++        for key in (
++            "exact_weight",
++            "coverage_weight",
++            "semantic_enabled",
++            "vespa_document_url",
++            "vespa_timeout",
++            "vector_cache_documents",
++            "_vector_provider",
++        ):
++            if key in entry:
++                per_scorer[key] = entry[key]
++
++    if name == "embedding_similarity":
++        reference = entry.get("reference_answer", top_reference)
++        if reference is not None:
++            per_scorer["reference_answer"] = reference
++        for key in ("method", "model"):
++            if key in entry:
++                per_scorer[key] = entry[key]
++
+     if name == "llm_judge":
+         judge = dict(top_judge)
+         # Entry-level judge keys override top-level normalized judge config.
+         for key in ("judge_base_url", "judge_api_key", "judge_model",
+-                    "prompt_template", "timeout", "_transport"):
++                    "prompt_template", "timeout", "_transport",
++                    "dimension_weights", "max_concurrency", "max_tokens"):
+             if key in entry:
+                 judge[key] = entry[key]
++        # Forward any per-scorer enable_<dim> toggle so it overrides the
++        # top-level normalized config for this scorer.
++        for key in entry:
++            if str(key).startswith("enable_"):
++                judge[key] = entry[key]
+         if judge:
+             per_scorer.update(judge)
+         # A weight nested in the top-level judge dict applies to llm_judge
+@@ -226,12 +325,60 @@ def _instantiate_scorer(
+         if top_judge.get("weight") is not None and "weight" not in per_scorer:
+             per_scorer["weight"] = top_judge["weight"]
+ 
++    if name == "token_efficiency":
++        # Token counts/budget come through the per-scorer entry as config; the
++        # evaluator injects the trajectory-derived totals before building.
++        for key in ("total_completion_tokens", "total_prompt_tokens",
++                    "budget_tokens"):
++            if key in entry:
++                per_scorer[key] = entry[key]
++
+     return cls(config=per_scorer, weight=weight, enabled=enabled)
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# Evaluator
+-# ---------------------------------------------------------------------------
++def _inject_token_counts(
++    config: dict[str, Any], trajectory: Trajectory
++) -> dict[str, Any]:
++    """Merge trajectory-derived token totals into the token_efficiency entry.
++
++    Recomputes the completion/prompt token totals over ``trajectory.traces``
++    and merges them into the raw ``token_efficiency`` scorer entry (under
++    ``total_completion_tokens`` / ``total_prompt_tokens``) so the scorer can
++    read them from its per-scorer config. Returns a shallow copy and never
++    mutates the caller's config (which is reused across evaluations). Entries
++    that already set a count win, so an explicit config always overrides.
++    """
++    scorers = config.get("scorers")
++    if not isinstance(scorers, list):
++        return config
++
++    has_token = any(
++        isinstance(e, dict) and e.get("name") == "token_efficiency"
++        for e in scorers
++    )
++    if not has_token:
++        return config
++
++    total_completion = sum(
++        len(t.response_ids) for t in trajectory.traces if t.response_ids
++    )
++    total_prompt = sum(
++        len(t.prompt_ids) for t in trajectory.traces if t.prompt_ids
++    )
++
++    new_scorers: list[Any] = []
++    for entry in scorers:
++        if isinstance(entry, dict) and entry.get("name") == "token_efficiency":
++            merged = dict(entry)
++            merged.setdefault("total_completion_tokens", total_completion)
++            merged.setdefault("total_prompt_tokens", total_prompt)
++            new_scorers.append(merged)
++        else:
++            new_scorers.append(entry)
++
++    new_config = dict(config)
++    new_config["scorers"] = new_scorers
++    return new_config
+ 
+ 
+ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
+@@ -252,19 +399,109 @@ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
+     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
+         raw = trajectory.metadata.get("xyne_raw")
+         if raw is None:
+-            return EvalResult(outcome_reward=0.0, metadata={"error": "missing xyne_raw"})
++            # Issue 37: Check if partial metadata exists (tool calls, chunks)
++            # even without a full xyne_raw flow. Log the reason for observability.
++            partial_meta = {}
++            traj_meta = trajectory.metadata.get("trajectory_metadata") or {}
++            ev = traj_meta.get("evaluation") or {}
++            if ev.get("result_timeout"):
++                partial_meta["reason"] = "session_timeout"
++            elif trajectory.metadata.get("xyne_raw_error"):
++                partial_meta["reason"] = "raw_read_error"
++                partial_meta["detail"] = str(trajectory.metadata.get("xyne_raw_error"))
++            elif trajectory.metadata.get("xyne_exec_error"):
++                partial_meta["reason"] = "exec_error"
++            else:
++                partial_meta["reason"] = "no_raw_flow"
++            return EvalResult(outcome_reward=0.0, metadata={"error": "missing xyne_raw", **partial_meta})
+ 
+         try:
+             flow = _parse_raw(raw)
+-            pipeline = _build_pipeline(self.config)
+-            composite = pipeline.run(flow)
+-            per_scorer = pipeline.per_scorer_scores(flow)
+-        except Exception:
++            # The gold answer belongs to the task/evaluator config, not the
++            # Xyne HTTP dump. Attach it to this local flow copy so both the
++            # deterministic similarity scorer and the LLM judge compare
++            # against the same reference without mutating the trajectory.
++            reference = self.config.get("reference_answer")
++            if isinstance(reference, str) and reference.strip():
++                flow.metadata = dict(flow.metadata)
++                flow.metadata.setdefault("reference_answer", reference)
++
++            # Completion/format are safety gates, not positive reward. A
++            # failed or empty run must never receive a baseline merely because
++            # other heuristic scorers defaulted optimistically.
++            # Also gate incomplete agentic turns: stopReason=toolUse with no
++            # executed tools (planning stub only) — same as fetch_flow's
++            # incomplete_agentic marker when present on the raw dump.
++            incomplete = _detect_incomplete_agentic(flow)
++            if (
++                flow.error is not None
++                or incomplete
++                or not (flow.answer and flow.answer.strip())
++            ):
++                return EvalResult(
++                    outcome_reward=0.0,
++                    metadata={
++                        "failure_gate": True,
++                        "raw_flow": _trim_flow(flow),
++                        **(
++                            {"incomplete_agentic": incomplete}
++                            if incomplete
++                            else {}
++                        ),
++                    },
++                )
++            pipeline = _build_pipeline(_inject_token_counts(self.config, trajectory))
++            composite, per_scorer = await asyncio.to_thread(
++                pipeline.run_with_scores, flow
++            )
++        except Exception as exc:
+             # Never raise out of evaluation; malformed input -> 0.0.
+-            return EvalResult(outcome_reward=0.0, metadata={"error": "failed to evaluate"})
++            logger.exception("XyneCompositeEvaluator failed")
++            return EvalResult(
++                outcome_reward=0.0,
++                metadata={
++                    "error": "failed to evaluate",
++                    "exception": f"{type(exc).__name__}: {exc}",
++                },
++            )
++
++        try:
++            scorer_io = pipeline.scorer_details()
++        except Exception:
++            scorer_io = {}
++        # Include gold/doc IDs and reference in metadata so the trainer can
++        # compute MI, NDCG, gold_coverage, diversity, and shared_answer.
++        gold_meta: dict[str, Any] = {}
++        expected_docs = self.config.get("expected_doc_ids")
++        expected_chunks = self.config.get("expected_chunk_ids")
++        reference = self.config.get("reference_answer")
++        # Fallback: extract gold IDs from the scorer objects themselves
++        if not expected_docs or not expected_chunks:
++            for scorer in pipeline._scorers:
++                if scorer.name == "gold_evidence_coverage":
++                    if not expected_chunks and getattr(scorer, "gold_chunks", None):
++                        expected_chunks = sorted(scorer.gold_chunks)
++                    if not expected_docs and getattr(scorer, "gold_documents", None):
++                        expected_docs = sorted(scorer.gold_documents)
++                    break
++        if not reference:
++            for scorer in pipeline._scorers:
++                if scorer.name == "embedding_similarity":
++                    ref = getattr(scorer, "reference_answer", None)
++                    if ref:
++                        reference = ref
++                    break
++        if expected_docs:
++            gold_meta["expected_doc_ids"] = expected_docs
++        if expected_chunks:
++            gold_meta["gold_chunk_ids"] = expected_chunks
++        if reference:
++            gold_meta["reference_answer"] = reference
+ 
+         metadata: dict[str, Any] = {
+             "per_scorer": per_scorer,
+             "raw_flow": _trim_flow(flow),
++            "scorer_io": scorer_io,
++            **gold_meta,
+         }
+         return EvalResult(outcome_reward=float(composite), metadata=metadata)
+diff --git a/src/polar/xyne/harness.py b/src/polar/xyne/harness.py
+index b2d893ac..9dc6ac86 100644
+--- a/src/polar/xyne/harness.py
++++ b/src/polar/xyne/harness.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ import base64
+ import json
++import asyncio
+ import shlex
+ from pathlib import Path
+ 
+@@ -162,27 +163,29 @@ class XyneHarness(BaseHarness):
+         # registers its instruction; the proxy selects the matching session
+         # from the outgoing chat-completions request body.
+         # This MUST run even when skip_boot=True (persistent backend), because
+-        # the persistent backend was started with LITELLM_BASE_URL=:18100.
++        # the persistent TEST backend is started with LITELLM_BASE_URL=:18113.
+         proxy_env = ["true"]
+         if self.env.get("LITELLM_BASE_URL"):
+             proxy_code = self._render_proxy_source()
+ 
+             b64 = base64.b64encode(proxy_code.encode()).decode()
+             proxy_env.append(
+-                # Initialize the one shared proxy once. The lock is held only
+-                # during startup, never for the duration of an agent turn.
++                # Initialize the one shared TEST proxy once. The lock is held
++                # only during startup, never for the duration of an agent turn.
++                # Port :18113 (not :18100) keeps the TEST lane off the prod
++                # backend's shared LITELLM_BASE_URL=:18100 hop.
+                 "(exec 8>/tmp/polar_proxy_init.lock; flock 8; "
+-                "if ! curl -sf -o /dev/null -m 2 http://127.0.0.1:18100/health; then "
++                "if ! curl -sf -o /dev/null -m 2 http://127.0.0.1:18113/health; then "
+                 f"echo {b64} | base64 -d > /tmp/_sess_proxy.py; "
+                 "nohup python3 /tmp/_sess_proxy.py >/tmp/_sess_proxy.log 2>&1 & "
+                 "for _proxy_i in 1 2 3 4 5 6 7 8 9 10; do "
+-                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18100/health && break; sleep 0.2; "
++                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18113/health && break; sleep 0.2; "
+                 "done "
+                 "fi; flock -u 8)"
+             )
+             proxy_env.append(
+                 "for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do "
+-                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18100/health && break; sleep 0.5; done"
++                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18113/health && break; sleep 0.5; done"
+             )
+             # Include a per-session marker in the Xyne prompt. This makes
+             # routing deterministic even when many samples have identical
+@@ -222,7 +225,7 @@ class XyneHarness(BaseHarness):
+             proxy_env.append(
+                 "python3 -c " + shlex.quote(route_register_py)
+             )
+-            proxy_env.append("export LITELLM_BASE_URL=http://127.0.0.1:18100")
++            proxy_env.append("export LITELLM_BASE_URL=http://127.0.0.1:18113")
+         if self.env.get("LITELLM_API_KEY"):
+             proxy_env.append(
+                 "export LITELLM_API_KEY="
+@@ -360,10 +363,24 @@ class XyneHarness(BaseHarness):
+                 except Exception:
+                     pass
+         raw_path = str(result.metadata.get("xyne_raw_path") or RAW_PATH)
+-        try:
+-            exec_result = await runtime.exec(f"cat {shlex.quote(raw_path)}")
+-        except Exception as exc:  # noqa: BLE001 - best-effort collection
+-            result.metadata["xyne_raw_error"] = f"read failed: {exc}"
++        # Issue 36: Retry reading the raw flow file a few times.
++        # On session timeout the xyne-server may still be flushing the file.
++        exec_result = None
++        for _attempt in range(3):
++            try:
++                exec_result = await runtime.exec(f"cat {shlex.quote(raw_path)}")
++                if exec_result.return_code == 0 and (exec_result.stdout or "").strip():
++                    break
++            except Exception as exc:  # noqa: BLE001 - best-effort collection
++                if _attempt == 2:
++                    result.metadata["xyne_raw_error"] = f"read failed: {exc}"
++                    return
++            await asyncio.sleep(1.0)
++        if exec_result is None or exec_result.return_code != 0:
++            result.metadata["xyne_raw_error"] = (
++                f"read failed (rc={exec_result.return_code if exec_result else 'no-result'}): "
++                f"{exec_result.stderr if exec_result else 'no raw-flow file written'}"
++            )
+             return
+ 
+         if exec_result.return_code != 0:
+diff --git a/src/polar/xyne/reward_pipeline.py b/src/polar/xyne/reward_pipeline.py
+index ce472687..6cb0fbbc 100644
+--- a/src/polar/xyne/reward_pipeline.py
++++ b/src/polar/xyne/reward_pipeline.py
+@@ -165,28 +165,51 @@ class RewardPipeline:
+         Returns ``0.0`` when no scorer is enabled or when the sum of enabled
+         weights is zero (a division-by-zero guard).
+         """
+-        relevant = self._enabled_scorers()
+-        if not relevant:
+-            return 0.0
+-
+-        total_weight = 0.0
+-        weighted = 0.0
+-        for scorer in relevant:
+-            score = scorer.score(flow)
+-            w = scorer.weight
+-            weighted += w * score
+-            total_weight += w
++        composite, _ = self.run_with_scores(flow)
++        return composite
+ 
++    def run_with_scores(self, flow: "XyneRawFlow") -> tuple[float, dict[str, float]]:
++        """Evaluate each enabled scorer once and return composite plus details."""
++        relevant = self._enabled_scorers()
++        evaluated = [(scorer, scorer.score(flow)) for scorer in relevant]
++        scores = {scorer.name: score for scorer, score in evaluated}
++        total_weight = sum(scorer.weight for scorer in relevant)
+         if total_weight == 0.0:
+-            return 0.0
+-        return weighted / total_weight
++            return 0.0, scores
++        # Use each evaluated instance's own score. Looking it back up by name
++        # corrupts the numerator when a config accidentally repeats a scorer.
++        weighted = sum(scorer.weight * score for scorer, score in evaluated)
++        return weighted / total_weight, scores
+ 
+     def per_scorer_scores(self, flow: "XyneRawFlow") -> dict[str, float]:
+         """Return ``{scorer_name: score}`` over all enabled scorers.
+ 
+         Used by the evaluator (todo 5) to populate ``EvalResult.metadata``.
+         """
+-        return {s.name: s.score(flow) for s in self._enabled_scorers()}
++        _, scores = self.run_with_scores(flow)
++        return scores
++
++    def scorer_details(self) -> dict[str, Any]:
++        """Collect raw per-scorer diagnostics (e.g. LLM-judge input/output).
++
++        Non-fatal: any scorer without ``raw_io`` is skipped; exceptions are
++        swallowed so diagnostics never break evaluation.
++        """
++        details: dict[str, Any] = {}
++        for scorer in self._scorers:
++            getter = getattr(scorer, "raw_io", None)
++            if not callable(getter):
++                continue
++            try:
++                io = getter()
++            except Exception:
++                continue
++            if io:
++                details.setdefault(scorer.name, {}).update(io)
++        return details
++
++
++
+ 
+ 
+ def build_pipeline(config: XyneRewardConfig | dict[str, Any]) -> RewardPipeline:
+diff --git a/src/polar/xyne/scorers/__init__.py b/src/polar/xyne/scorers/__init__.py
+index d575bca1..76ac1dc9 100644
+--- a/src/polar/xyne/scorers/__init__.py
++++ b/src/polar/xyne/scorers/__init__.py
+@@ -19,9 +19,15 @@ from polar.xyne.scorers import citation_accuracy  # noqa: F401
+ from polar.xyne.scorers import citation_presence  # noqa: F401
+ from polar.xyne.scorers import citation_relevance  # noqa: F401
+ from polar.xyne.scorers import completion  # noqa: F401
++from polar.xyne.scorers import embedding_similarity  # noqa: F401
++from polar.xyne.scorers import gold_evidence_coverage  # noqa: F401
++from polar.xyne.scorers import citation_evidence_coverage  # noqa: F401
+ from polar.xyne.scorers import llm_judge  # noqa: F401
+ from polar.xyne.scorers import retrieval_quality  # noqa: F401
+ from polar.xyne.scorers import subagent_success  # noqa: F401
++from polar.xyne.scorers import token_efficiency  # noqa: F401
++from polar.xyne.scorers import tool_call_efficiency  # noqa: F401
++from polar.xyne.scorers import tool_evidence_utility  # noqa: F401
+ 
+ # All built-in scorers, keyed by canonical name, for pipeline construction.
+ ALL_SCORERS: dict[str, type[XyneScorer]] = dict(SCORER_REGISTRY)
+@@ -37,5 +43,11 @@ __all__ = [
+     "citation_accuracy",
+     "retrieval_quality",
+     "subagent_success",
++    "embedding_similarity",
++    "gold_evidence_coverage",
++    "citation_evidence_coverage",
++    "tool_call_efficiency",
++    "tool_evidence_utility",
++    "token_efficiency",
+     "llm_judge",
+ ]
+diff --git a/src/polar/xyne/scorers/citation_accuracy.py b/src/polar/xyne/scorers/citation_accuracy.py
+index b1516982..1276466b 100644
+--- a/src/polar/xyne/scorers/citation_accuracy.py
++++ b/src/polar/xyne/scorers/citation_accuracy.py
+@@ -9,8 +9,8 @@ Semantics (documented and locked by tests):
+ - ``expected_doc_ids`` empty -> ``1.0``. No expectation means no penalty; an
+   empty expectation set is not a failure to meet.
+ - Expected set non-empty and no citations match -> ``0.0``.
+-- Expected set non-empty and some citations match -> fraction of citations
+-  that match, i.e. ``matched / len(citations)`` (bounded to ``[0,1]``).
++- Expected set non-empty -> document-set F1 between cited and expected IDs.
++  This rewards coverage while penalizing unrelated citation spam.
+ 
+ Citations that are non-dict or carry no identifier simply never match and are
+ counted in the denominator, dragging the fraction down.
+@@ -70,7 +70,13 @@ class CitationAccuracyScorer(XyneScorer):
+         citations = flow.citations
+         if not citations:
+             return 0.0
+-        matched = sum(1 for item in citations if _citation_id(item) in self._expected)
+-        if matched == 0:
++        cited = {
++            identifier for item in citations
++            if (identifier := _citation_id(item)) is not None
++        }
++        matched = len(cited & self._expected)
++        if matched == 0 or not cited:
+             return 0.0
+-        return min(1.0, max(0.0, matched / len(citations)))
++        precision = matched / len(cited)
++        recall = matched / len(self._expected)
++        return 2.0 * precision * recall / (precision + recall)
+diff --git a/src/polar/xyne/scorers/citation_presence.py b/src/polar/xyne/scorers/citation_presence.py
+index 5268e08c..7b1c5826 100644
+--- a/src/polar/xyne/scorers/citation_presence.py
++++ b/src/polar/xyne/scorers/citation_presence.py
+@@ -18,7 +18,7 @@ NAME = "citation_presence"
+ 
+ @register_scorer(NAME)
+ class CitationPresenceScorer(XyneScorer):
+-    """1.0 iff ``flow.citations`` contains at least one item, else 0.0."""
++    """1.0 iff at least one citation has a resolvable document identifier."""
+ 
+     name = NAME
+ 
+@@ -36,4 +36,8 @@ class CitationPresenceScorer(XyneScorer):
+         )
+ 
+     def score(self, flow: XyneRawFlow) -> float:
+-        return 1.0 if flow.citations else 0.0
++        return 1.0 if any(
++            isinstance(item, dict)
++            and bool(item.get("docId") or item.get("itemId"))
++            for item in flow.citations
++        ) else 0.0
+diff --git a/src/polar/xyne/scorers/citation_relevance.py b/src/polar/xyne/scorers/citation_relevance.py
+index a4f99e5f..5f152475 100644
+--- a/src/polar/xyne/scorers/citation_relevance.py
++++ b/src/polar/xyne/scorers/citation_relevance.py
+@@ -32,11 +32,16 @@ def _relevance_of(item: object) -> float:
+     if not isinstance(item, Mapping):
+         return 0.0
+     value = item.get("relevance")
++    if isinstance(value, str):
++        try:
++            value = float(value)
++        except ValueError:
++            return 0.0
+     if not isinstance(value, (int, float)) or isinstance(value, bool):
+         return 0.0
+     if not isfinite(value):
+         return 0.0
+-    return float(value)
++    return min(1.0, max(0.0, float(value)))
+ 
+ 
+ @register_scorer(NAME)
+diff --git a/src/polar/xyne/scorers/llm_judge.py b/src/polar/xyne/scorers/llm_judge.py
+index 1e2c031b..ec853560 100644
+--- a/src/polar/xyne/scorers/llm_judge.py
++++ b/src/polar/xyne/scorers/llm_judge.py
+@@ -2,10 +2,21 @@
+ 
+ This is the ONLY scorer permitted to make a network call. It POSTs the
+ question, answer and citations to an OpenAI-compatible ``/v1/chat/completions``
+-endpoint and asks the judge to return a single float in ``[0, 1]``. It never
+-calls Xyne, and it never raises out of ``score`` — any HTTP, parsing, or
++endpoint and runs **four async judge dimensions** — ``quality``, ``correctness``,
++``groundedness`` and ``citation_accuracy`` — each returning one of ``0.0``,
++``0.5`` or ``1.0``, then aggregates them into a single composite in ``[0, 1]``. It
++never calls Xyne, and it never raises out of ``score`` — any HTTP, parsing, or
+ configuration problem yields ``0.0``.
+ 
++Concurrency
++-----------
++The four dimension calls are dispatched concurrently via a shared
++``asyncio.Semaphore`` (default capacity 20). The sync :meth:`score` bridges to
++the async work internally so the synchronous ``RewardPipeline`` can keep using
++it unchanged. A clean async path (:meth:`score_async`) is also exposed for
++async callers (e.g. an evaluator) that want to ``await`` it and share an HTTP
++client.
++
+ Config (via the scorer config dict):
+ 
+ - ``judge_base_url`` (required): e.g. ``http://localhost:8080/v1``. The scorer
+@@ -13,19 +24,30 @@ Config (via the scorer config dict):
+ - ``judge_api_key``: bearer token, optional.
+ - ``judge_model``: model name, default ``gpt-4o-mini``.
+ - ``prompt_template``: format string with ``{question}``, ``{answer}``,
+-  ``{citations}`` placeholders.
++  ``{citations}``, ``{reference}``, ``{dimension}`` and ``{rubric}``
++  placeholders.
+ - ``timeout``: request timeout in seconds, default ``10.0``.
+ - ``_transport``: an ``httpx.BaseTransport`` for unit tests (never passed in
+   production config) — lets tests inject a ``MockTransport`` with no network.
++- ``max_concurrency``: max concurrent judge HTTP calls (asyncio semaphore),
++  default ``20``.
++- ``dimension_weights``: ``{dim: weight}`` for the four dimensions; missing
++  dimensions default to ``1.0``.
++- ``enable_<dim>``: optional boolean toggle per dimension (``enable_quality``,
++  ...); default all enabled.
+ 
+-The judge response is expected as ``choices[0].message.content`` containing a
+-number. Missing/non-numeric content yields ``0.0``. The parsed score is clamped
+-to ``[0.0, 1.0]``.
++The judge response for each dimension is expected as
++``choices[0].message.content`` containing a number. Missing/non-numeric content
++yields ``0.0`` for that dimension. The parsed score is clamped to ``[0.0, 1.0]``.
++The composite is the weighted average of the enabled dimensions; if all
++dimensions are disabled it is ``0.0``.
+ """
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import re
++import threading
+ import httpx
+ from math import isfinite
+ 
+@@ -36,41 +58,130 @@ __all__ = ["LLMJudgeScorer"]
+ 
+ NAME = "llm_judge"
+ 
++# The four judge dimensions scored by this scorer, in evaluation order.
++DIMENSIONS = ("quality", "correctness", "groundedness", "citation_accuracy")
++
++DEFAULT_MAX_CONCURRENCY = 20
++DEFAULT_TIMEOUT = 10.0
++# Minimum max_tokens guard: the production judge (glm-flash-experimental)
++# emits a long reasoning_content (CoT) block before content, so a tiny cap
++# truncates before the final `Score:` and yields null content -> 0.0.
++DEFAULT_MAX_TOKENS = 4096
++_MIN_MAX_TOKENS = 64
++
++_JUDGE_SYSTEM_PROMPT = (
++    "You are an impartial, expert judge. Apply the most stringent standards "
++    "possible and show no leniency. You will evaluate an assistant's answer to "
++    "a user question together with the cited source snippets. Assess the answer "
++    "against a single specified dimension and return the score as one of exactly "
++    "0.0, 0.5, or 1.0 for that dimension (0.0 = bad, 0.5 = partial, 1.0 = good). "
++    "You may give at most one short sentence of justification. "
++    "Then return your score as the very last line of your response in exactly "
++    "this format: `Score: <0.0, 0.5, or 1.0>`. No other trailing text."
++)
++
++# Dimension-specific rubrics: what the judge should optimise for, in the style
++# of the gold-standard multi-dimensional judge in sglang's bench_other.py.
++DIMENSION_RUBRICS = {
++    "quality": (
++        "Quality: judge the overall quality of the answer — its clarity, "
++        "coherence, completeness, and how well it addresses the user's "
++        "question. A high-quality answer is clear, well-structured, complete, "
++        "and directly responsive. Penalise vague, rambling, or incomplete "
++        "answers."
++    ),
++    "correctness": (
++        "Correctness: judge the factual accuracy of the answer. When a "
++        "reference (ground-truth) answer is provided, compare against it; "
++        "otherwise judge against general factual correctness and internal "
++        "consistency. Penalise factual errors, unsupported claims, and "
++        "contradictions."
++    ),
++    "groundedness": (
++        "Groundedness: judge whether the answer stays grounded in the provided "
++        "cited snippets. Every substantive claim must be supported by the "
++        "citations. Penalise fabrication, hallucinated details, or claims that "
++        "cannot be traced back to the cited evidence."
++    ),
++    "citation_accuracy": (
++        "Citation accuracy: judge whether the answer's claims match and are "
++        "supported by the specific cited snippets. Penalise answers that cite "
++        "a source that does not actually support the claim, misquote the "
++        "snippet, or use citations loosely."
++    ),
++}
++
+ DEFAULT_PROMPT_TEMPLATE = (
+-    "You are an expert judge. Given the question, the answer, and the supporting "
+-    "citations, rate the quality of the answer on a scale from 0.0 to 1.0.\n\n"
+-    "Question: {question}\n\nAnswer: {answer}\n\n"
+-    "Citations:\n{citations}\n\n"
+-    "Return ONLY a single float between 0.0 and 1.0."
++    "User question: {question}\n\n"
++    "Assistant answer: {answer}\n\n"
++    "Cited snippets:\n{citations}\n"
++    "{reference}"
++    "\nDimension rubric ({dimension}):\n{rubric}"
++    "\n\nOUTPUT FORMAT (mandatory - enforced): Respond with AT MOST ONE short"
++    " sentence of justification, then a FINAL line containing ONLY the score"
++    " label in EXACTLY this form (no other trailing text):"
++    "\nScore: <0.0, 0.5, or 1.0>"
++    "\nA response that does not end with that exact line is rejected and scores 0.0."
+ )
+ 
+ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
++# A number appearing after a "Score:" / "score" label.
++_SCORE_LABEL_RE = re.compile(r"Score\s*:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
++
++
++def _quantize(value: float) -> float:
++    """Snap a finite float to the nearest of {0.0, 0.5, 1.0}.
++
++    Clamps to ``[0.0, 1.0]`` first, then rounds to the nearest half via
++    ``round(value * 2) / 2.0`` (Python's round-half-even, which is
++    deterministic). The result is always one of ``0.0``, ``0.5``, or ``1.0``.
++    """
++    # Clamp first so out-of-range values snap to the boundary, not past it.
++    clamped = min(1.0, max(0.0, value))
++    return round(clamped * 2) / 2.0
+ 
+ 
+ def _extract_score(text: str) -> float | None:
+-    """Parse a float from the judge's text; return None if not parseable."""
++    """Parse a float from the judge's text; return None if not parseable.
++
++    Prefers the (last) number following a ``Score:`` label — the intended
++    output contract — then falls back to a lone or first bare number. Returns
++    ``None`` (mapped to ``0.0`` by the caller) when nothing is parseable.
++    """
+     stripped = text.strip()
+-    # Trim common fences/whitespace around the number.
++    # Prefer the number on a trailing "Score: <num>" label; pick the LAST
++    # labeled number so the model's final score wins over justification text.
++    labeled = list(_SCORE_LABEL_RE.finditer(stripped))
++    if labeled:
++        match = labeled[-1]
++        try:
++            value = float(match.group(1))
++        except ValueError:
++            value = None
++        if value is not None and isfinite(value):
++            return _quantize(value)
++
+     for candidate in (stripped, stripped.strip("`"), stripped.strip(".")):
+         try:
+             value = float(candidate)
+         except ValueError:
+             continue
+         if isfinite(value):
+-            return value
++            return _quantize(value)
++
+     match = _NUMBER_RE.search(stripped)
+     if match:
+         try:
+             value = float(match.group(0))
+         except ValueError:
+             return None
+-        return value if isfinite(value) else None
++        return _quantize(value) if isfinite(value) else None
+     return None
+ 
+ 
+ @register_scorer(NAME)
+ class LLMJudgeScorer(XyneScorer):
+-    """Post Q+A+citations to a judge endpoint and return its float score."""
++    """Post Q+A+citations to a judge endpoint and return a composite score."""
+ 
+     name = NAME
+ 
+@@ -92,64 +203,294 @@ class LLMJudgeScorer(XyneScorer):
+         self._prompt_template = str(
+             cfg.get("prompt_template") or DEFAULT_PROMPT_TEMPLATE
+         )
+-        self._timeout = float(cfg.get("timeout", 10.0))
++        self._timeout = float(cfg.get("timeout", DEFAULT_TIMEOUT))
+         self._transport = cfg.get("_transport")
+ 
+-    def _build_request_body(self, flow: XyneRawFlow) -> dict:
+-        citations = _render_citations(flow.citations)
++        raw_max_tokens = cfg.get("max_tokens", DEFAULT_MAX_TOKENS)
++        try:
++            self._max_tokens = (
++                int(raw_max_tokens)
++                if raw_max_tokens not in (None, "")
++                else DEFAULT_MAX_TOKENS
++            )
++        except (TypeError, ValueError):
++            self._max_tokens = DEFAULT_MAX_TOKENS
++        if self._max_tokens < _MIN_MAX_TOKENS:
++            self._max_tokens = _MIN_MAX_TOKENS
++
++        raw_max_concurrency = cfg.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
++        try:
++            self._max_concurrency = (
++                int(raw_max_concurrency)
++                if raw_max_concurrency not in (None, "")
++                else DEFAULT_MAX_CONCURRENCY
++            )
++        except (TypeError, ValueError):
++            self._max_concurrency = DEFAULT_MAX_CONCURRENCY
++        if self._max_concurrency < 1:
++            self._max_concurrency = 1
++
++        # Per-dimension weights (default all 1.0).
++        raw_weights = cfg.get("dimension_weights")
++        self._dimension_weights: dict[str, float] = {}
++        if isinstance(raw_weights, dict):
++            for dim in DIMENSIONS:
++                raw = raw_weights.get(dim)
++                try:
++                    self._dimension_weights[dim] = (
++                        float(raw) if raw is not None else 1.0
++                    )
++                except (TypeError, ValueError):
++                    self._dimension_weights[dim] = 1.0
++        else:
++            self._dimension_weights = {dim: 1.0 for dim in DIMENSIONS}
++
++        # Per-dimension enable toggles (default all enabled).
++        self._enabled_dims: dict[str, bool] = {
++            dim: bool(cfg.get(f"enable_{dim}", True)) for dim in DIMENSIONS
++        }
++        # Raw per-dimension judge request/response for diagnostics (group dumps).
++        self._io: dict[str, dict] = {}
++
++    # -- prompt / request construction --------------------------------------
++
++    def _reference_answer(self, flow: XyneRawFlow) -> str:
++        """Return the reference/ground-truth answer if available (from metadata)."""
++        try:
++            ref = (
++                flow.metadata.get("reference_answer")
++                or flow.metadata.get("reference")
++                or flow.metadata.get("gold_answer")
++            )
++        except Exception:
++            return ""
++        return str(ref).strip() if ref else ""
++
++    def _build_dimension_body(self, flow: XyneRawFlow, dim: str) -> dict:
++        citations = _render_citations(flow.citations, flow=flow)
+         question = _first_question(flow.request_messages)
+-        prompt = self._prompt_template.format(
+-            question=question, answer=flow.answer, citations=citations
++        reference = self._reference_answer(flow)
++
++        # Build reference block with ground truth answer + gold doc/chunk IDs
++        gold_doc_ids = flow.metadata.get("expected_doc_ids") or flow.metadata.get("gold_doc_ids") or []
++        gold_chunk_ids = flow.metadata.get("expected_chunk_ids") or flow.metadata.get("gold_chunk_ids") or []
++        reference_parts = []
++        if reference:
++            reference_parts.append(f"Reference (ground truth) answer: {reference}")
++        if gold_doc_ids:
++            reference_parts.append(f"Ground truth document IDs: {', '.join(str(d) for d in gold_doc_ids)}")
++        if gold_chunk_ids:
++            reference_parts.append(f"Ground truth chunk IDs: {', '.join(str(c) for c in gold_chunk_ids)}")
++        reference_block = ("\n" + "\n".join(reference_parts) + "\n") if reference_parts else ""
++
++        user_content = self._prompt_template.format(
++            question=question,
++            answer=flow.answer,
++            citations=citations,
++            reference=reference_block,
++            dimension=dim,
++            rubric=DIMENSION_RUBRICS.get(dim, ""),
+         )
+         return {
+             "model": self._model,
+             "temperature": 0.0,
+-            "messages": [{"role": "user", "content": prompt}],
++            "max_tokens": self._max_tokens,
++            "messages": [
++                {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
++                {"role": "user", "content": user_content},
++            ],
+         }
+ 
+-    def _post(self, body: dict) -> httpx.Response:
++    # -- HTTP ----------------------------------------------------------------
++
++    def _headers(self) -> dict:
+         headers = {"Content-Type": "application/json"}
+         if self._api_key:
+             headers["Authorization"] = f"Bearer {self._api_key}"
+-        kwargs: dict = {}
++        return headers
++
++    def _client_kwargs(self) -> dict:
++        kwargs: dict = {"timeout": self._timeout}
+         if self._transport is not None:
+             kwargs["transport"] = self._transport
+-        with httpx.Client(timeout=self._timeout, **kwargs) as client:
+-            return client.post(f"{self._base_url}/chat/completions", json=body, headers=headers)
++        return kwargs
++
++    async def _post_async(self, body: dict) -> httpx.Response:
++        async with httpx.AsyncClient(**self._client_kwargs()) as client:
++            return await client.post(
++                f"{self._base_url}/chat/completions",
++                json=body,
++                headers=self._headers(),
++            )
++
++    # -- async scoring -------------------------------------------------------
++
++    async def _score_dimension(self, flow: XyneRawFlow, dim: str, sem: asyncio.Semaphore) -> float:
++        """Score one dimension with the semaphore held; never raises.
++
++        Also records the raw judge request (input) and response (output) per
++        dimension into ``self._io`` so downstream group dumps can include the
++        LLM-judge's raw prompt+answer for diagnostics.
++        """
++        async with sem:
++            body = self._build_dimension_body(flow, dim)
++            try:
++                response = await self._post_async(body)
++                response.raise_for_status()
++                payload = response.json()
++                message = (payload["choices"][0].get("message") or {}) if payload.get("choices") else {}
++                content = message.get("content")
++                reasoning = message.get("reasoning_content")
++            except Exception:
++                return 0.0
++            value = _extract_score(content) if isinstance(content, str) else None
++            score = _quantize(value) if value is not None else 0.0
++            self._io[dim] = {
++                "dimension": dim,
++                "input": {"model": self._model, "url": f"{self._base_url}/chat/completions", "body": body},
++                "output": {
++                    "content": content if isinstance(content, str) else None,
++                    "reasoning_content": reasoning,
++                },
++                "score": score,
++            }
++            return score
++
++    async def score_async(self, flow: XyneRawFlow) -> float:
++        """Async multi-dimension judge; expose for evaluators that await it.
++
++        Returns the composite float in ``[0, 1]``. Returns ``0.0`` when no judge
++        is configured, or when every dimension is disabled.
++
++        A fresh ``asyncio.Semaphore`` is created per invocation (bound to the
++        current event loop) rather than shared across calls. Sharing one
++        semaphore across different event loops (e.g. the sync bridge's worker
++        thread vs. the caller's loop) would raise ``RuntimeError`` on a
++        contended acquire, so each invocation owns its own semaphore.
++        """
++        if not self._base_url:
++            return 0.0
++        dims = [d for d in DIMENSIONS if self._enabled_dims[d]]
++        if not dims:
++            return 0.0
++        sem = asyncio.Semaphore(self._max_concurrency)
++        dimension_scores = await asyncio.gather(
++            *(self._score_dimension(flow, d, sem) for d in dims)
++        )
++        scores = dict(zip(dims, dimension_scores))
++        return self._composite(scores)
++
++    def _composite(self, scores: dict[str, float]) -> float:
++        total_weight = 0.0
++        weighted = 0.0
++        for dim in DIMENSIONS:
++            if not self._enabled_dims[dim]:
++                continue
++            weight = self._dimension_weights.get(dim, 1.0)
++            total_weight += weight
++            weighted += weight * scores.get(dim, 0.0)
++        if total_weight == 0.0:
++            return 0.0
++        return min(1.0, max(0.0, weighted / total_weight))
++
++    def raw_io(self) -> dict:
++        """Return a deep copy of the raw per-dimension judge input/output."""
++        import copy as _copy
++        return _copy.deepcopy(dict(self._io))
++
++
++    # -- sync scoring --------------------------------------------------------
+ 
+     def score(self, flow: XyneRawFlow) -> float:
++        """Synchronous bridge: run the bounded async dimensions and return the composite.
++
++        Returns ``0.0`` immediately (no network) when no judge is configured.
++        Never raises; any failure resolves to ``0.0``.
++        """
+         if not self._base_url:
+             return 0.0
+         try:
+-            response = self._post(self._build_request_body(flow))
+-            response.raise_for_status()
+-            payload = response.json()
+-            content = payload["choices"][0]["message"]["content"]
++            running_loop = asyncio.get_running_loop()
++        except RuntimeError:
++            running_loop = None
++
++        if running_loop is not None:
++            # Called from inside a live event loop. We cannot block the running
++            # loop, so run the bounded judge calls to completion on a fresh
++            # loop in a short-lived worker thread and return synchronously.
++            result: list[float] = []
++
++            def _run() -> None:
++                try:
++                    result.append(asyncio.run(self.score_async(flow)))
++                except Exception:
++                    result.append(0.0)
++
++            worker = threading.Thread(target=_run, daemon=True)
++            worker.start()
++            worker.join()
++            return result[0] if result else 0.0
++
++        try:
++            return asyncio.run(self.score_async(flow))
+         except Exception:
+             return 0.0
+-        if not isinstance(content, str):
+-            return 0.0
+-        value = _extract_score(content)
+-        if value is None:
+-            return 0.0
+-        return min(1.0, max(0.0, value))
+ 
+ 
+-def _render_citations(citations: list[dict]) -> str:
++def _render_citations(
++    citations: list[dict], *, flow: XyneRawFlow | None = None
++) -> str:
++    """Render citations with source text resolved from normalized tool evidence."""
+     if not citations:
+-        return "(none)"
++        if not flow or not flow.retrieved_chunks:
++            return "(none)"
++        evidence = [
++            _render_citation_line(i, item)
++            for i, item in enumerate(flow.retrieved_chunks[:20], start=1)
++        ]
++        return "(none)\nRetrieved tool evidence (not answer citations):\n" + "\n".join(evidence)
++
++    evidence_by_key = {}
++    if flow:
++        evidence_by_key = {
++            (item.get("docId"), item.get("chunk")): item
++            for item in flow.retrieved_chunks
++            if isinstance(item, dict)
++        }
+     lines = []
+     for i, citation in enumerate(citations, start=1):
+         if not isinstance(citation, dict):
+             lines.append(f"{i}. (malformed citation)")
+             continue
+-        snippet = citation.get("snippet")
+-        if not isinstance(snippet, str):
+-            snippet = ""
+-        lines.append(f"{i}. {snippet.strip()}")
++        record = dict(citation)
++        key = (record.get("docId"), record.get("chunk", record.get("chunkIndex")))
++        evidence = evidence_by_key.get(key)
++        if evidence:
++            for field in ("snippet", "source_text", "title", "relevance"):
++                if field not in record and evidence.get(field) not in (None, ""):
++                    record[field] = evidence[field]
++        lines.append(_render_citation_line(i, record))
+     return "\n".join(lines) if lines else "(none)"
+ 
+ 
++def _render_citation_line(index: int, citation: dict) -> str:
++    """Render an identifier plus source text; never emit a blank citation line."""
++    text_keys = ("source_text", "snippet", "chunk", "content", "text", "page_text")
++    snippet = ""
++    for key in text_keys:
++        value = citation.get(key)
++        if isinstance(value, str) and value.strip():
++            snippet = value.strip()
++            break
++    doc_id = citation.get("docId") or citation.get("itemId")
++    chunk = citation.get("chunk", citation.get("chunkIndex"))
++    if doc_id and chunk is not None:
++        return f"{index}. [{doc_id}#{chunk}] {snippet}".rstrip()
++    if snippet:
++        return f"{index}. {snippet}"
++    return f"{index}. [source]"
++
++
+ def _first_question(request_messages: list[dict]) -> str:
+     for message in request_messages:
+         if isinstance(message, dict) and message.get("role") == "user":
+diff --git a/src/polar/xyne/scorers/retrieval_quality.py b/src/polar/xyne/scorers/retrieval_quality.py
+index 5ac9e185..628845fb 100644
+--- a/src/polar/xyne/scorers/retrieval_quality.py
++++ b/src/polar/xyne/scorers/retrieval_quality.py
+@@ -1,54 +1,82 @@
+-"""Retrieval-quality scorer: heuristic over sub-agent success + citation relevance.
++"""Retrieval-quality scorer over the evidence actually used by Xyne.
+ 
+-A run's retrieval is good when (a) its sub-agents succeeded and (b) the cited
+-chunks are relevant. The scorer combines both as a weighted average:
++The Xyne harness retrieves directly through Vespa tools and normally has no
++sub-agent runs. Reward retrieval using three observable signals instead:
+ 
+-    score = 0.5 * sub_agent_success + 0.5 * mean_citation_relevance
++* successful retrieval-tool execution (40%),
++* best normalized Vespa relevance among retrieved chunks (30%), and
++* cited chunks that resolve back to retrieved evidence (30%).
+ 
+-where ``sub_agent_success`` is the fraction of ``nested_runs`` with no
+-``error`` field, and ``mean_citation_relevance`` is the mean of citation
+-``relevance`` values (see :mod:`~polar.xyne.scorers.citation_relevance`).
+-
+-Guards (never raises, bounded [0,1]):
+-
+-- ``nested_runs`` empty -> ``sub_agent_success = 0.0`` (nothing succeeded);
+-  "vacuous true" is reserved for the dedicated SubagentSuccessScorer.
+-- ``citations`` empty -> ``mean_citation_relevance = 0.0``.
+-- A nested run that is not a dict, or lacks ``error``, counts as successful.
++This avoids the previous constant 0.5 reward created by treating an empty
++sub-agent list as a successful retrieval.
+ """
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Mapping
+-
+ from polar.xyne.reward_pipeline import XyneScorer, register_scorer
+ from polar.xyne.types import XyneRawFlow
+-from polar.xyne.scorers.citation_relevance import CitationRelevanceScorer
+ 
+ __all__ = ["RetrievalQualityScorer"]
+ 
+ NAME = "retrieval_quality"
+ 
+-_SUB_AGENT_WEIGHT = 0.5
+-_CITATION_WEIGHT = 0.5
++_TOOL_WEIGHT = 0.4
++_EVIDENCE_WEIGHT = 0.3
++_CITATION_WEIGHT = 0.3
++_RETRIEVAL_TOOL_MARKERS = ("search", "getchunks", "proximity", "foldertree")
++
+ 
++def _retrieval_tool_success(flow: XyneRawFlow) -> float:
++    calls = [
++        call for call in flow.tool_calls
++        if isinstance(call, dict)
++        and any(marker in str(call.get("toolName") or "").casefold()
++                for marker in _RETRIEVAL_TOOL_MARKERS)
++    ]
++    if not calls:
++        return 0.0
++    successful = sum(
++        1 for call in calls
++        if not call.get("isError")
++        and str(call.get("status") or "completed").casefold()
++        not in {"failed", "error", "cancelled", "canceled"}
++        and call.get("result") not in (None, "", [], {})
++    )
++    return successful / len(calls)
++
++
++def _best_evidence_relevance(flow: XyneRawFlow) -> float:
++    values = [
++        float(chunk["relevance"])
++        for chunk in flow.retrieved_chunks
++        if isinstance(chunk, dict)
++        and isinstance(chunk.get("relevance"), (int, float))
++    ]
++    if not values:
++        return 0.0
++    return max(0.0, min(1.0, max(values)))
+ 
+-def _sub_agent_success_fraction(nested_runs: list[dict]) -> float:
+-    """Fraction of nested runs with no ``error`` field (0.0 if none present)."""
+-    if not nested_runs:
++
++def _citation_evidence_coverage(flow: XyneRawFlow) -> float:
++    if not flow.citations:
+         return 0.0
+-    ok = 0
+-    for run in nested_runs:
+-        if not isinstance(run, Mapping):
+-            ok += 1  # non-dict item: no error field to be found -> successful
+-        elif "error" not in run or run["error"] is None:
+-            ok += 1
+-    return ok / len(nested_runs)
++    evidence = {
++        (item.get("docId"), item.get("chunk", item.get("chunkIndex")))
++        for item in flow.retrieved_chunks
++        if isinstance(item, dict)
++    }
++    resolved = sum(
++        1 for citation in flow.citations
++        if isinstance(citation, dict)
++        and (citation.get("docId"), citation.get("chunk", citation.get("chunkIndex")))
++        in evidence
++    )
++    return resolved / len(flow.citations)
+ 
+ 
+ @register_scorer(NAME)
+ class RetrievalQualityScorer(XyneScorer):
+-    """Combined sub-agent success + mean citation relevance heuristic."""
++    """Combined retrieval execution, evidence relevance, and citation coverage."""
+ 
+     name = NAME
+ 
+@@ -64,12 +92,10 @@ class RetrievalQualityScorer(XyneScorer):
+             weight=float(cfg.get("weight", weight)),
+             enabled=bool(cfg.get("enabled", enabled)),
+         )
+-        self._relevance = CitationRelevanceScorer(config=cfg)
+-
+     def score(self, flow: XyneRawFlow) -> float:
+-        sub_ok = _sub_agent_success_fraction(flow.nested_runs)
+-        relevance = self._relevance.score(flow)
+-        return min(
+-            1.0,
+-            max(0.0, _SUB_AGENT_WEIGHT * sub_ok + _CITATION_WEIGHT * relevance),
++        score = (
++            _TOOL_WEIGHT * _retrieval_tool_success(flow)
++            + _EVIDENCE_WEIGHT * _best_evidence_relevance(flow)
++            + _CITATION_WEIGHT * _citation_evidence_coverage(flow)
+         )
++        return min(1.0, max(0.0, score))
+diff --git a/src/polar/xyne/scorers/subagent_success.py b/src/polar/xyne/scorers/subagent_success.py
+index 7a2da10e..09fb974d 100644
+--- a/src/polar/xyne/scorers/subagent_success.py
++++ b/src/polar/xyne/scorers/subagent_success.py
+@@ -1,14 +1,18 @@
+-"""Sub-agent success scorer: all nested runs must be error-free.
++"""Sub-agent success scorer: all sub-agents must be error-free.
+ 
+-A run's sub-agents (the ``nested_runs`` tree from ``listNestedRuns``) together
+-succeeded iff every single one is free of an ``error`` field. Semantics
+-(documented and locked by tests):
++A run's sub-agents (the ``sub_agents`` list, e.g. from ``listNestedRuns``)
++together succeeded iff every single one is free of an ``error`` field.
++Semantics (documented and locked by tests):
+ 
+-- No nested runs -> ``1.0``. This is vacuously true: there is no failing
+-  sub-agent to penalize, so the run cannot have a sub-agent failure.
+-- Some nested run has a non-None ``error`` -> ``0.0`` (one failure fails all).
+-- A nested run with no ``error`` field, or ``error`` explicitly ``None``,
++- No sub-agents -> ``0.0``. The signal is not applicable and must not create
++  free positive reward in a harness that does not use sub-agents.
++- Some sub-agent has a non-None ``error`` -> ``0.0`` (one failure fails all).
++- A sub-agent with no ``error`` field, or ``error`` explicitly ``None``,
+   counts as successful. A non-dict item has no ``error`` so it is successful.
++
++Backward compatibility: older dumps only carry the ``nested_runs`` tree. When
++``sub_agents`` is empty but ``nested_runs`` is non-empty, we fall back to
++evaluating the ``nested_runs`` error check so old dumps still score correctly.
+ """
+ 
+ from __future__ import annotations
+@@ -23,9 +27,21 @@ __all__ = ["SubagentSuccessScorer"]
+ NAME = "subagent_success"
+ 
+ 
++def _has_error(item: object) -> bool:
++    """True if ``item`` (or its nested ``run``) carries a non-None error."""
++    if not isinstance(item, Mapping):
++        return False
++    if item.get("error") is not None:
++        return True
++    run = item.get("run")
++    if isinstance(run, Mapping) and run.get("error") is not None:
++        return True
++    return False
++
++
+ @register_scorer(NAME)
+ class SubagentSuccessScorer(XyneScorer):
+-    """1.0 iff every nested run is error-free (vacuously true when empty)."""
++    """1.0 iff at least one sub-agent ran and every sub-agent is error-free."""
+ 
+     name = NAME
+ 
+@@ -43,10 +59,17 @@ class SubagentSuccessScorer(XyneScorer):
+         )
+ 
+     def score(self, flow: XyneRawFlow) -> float:
++        sub_agents = flow.sub_agents
++        if sub_agents:
++            for agent in sub_agents:
++                if _has_error(agent):
++                    return 0.0
++            return 1.0
++        # Fallback for old dumps that only populate nested_runs.
+         nested_runs = flow.nested_runs
+         if not nested_runs:
+-            return 1.0
++            return 0.0
+         for run in nested_runs:
+-            if isinstance(run, Mapping) and run.get("error") is not None:
++            if not isinstance(run, Mapping) or run.get("error") is not None:
+                 return 0.0
+         return 1.0
+diff --git a/src/polar/xyne/session_proxy.py b/src/polar/xyne/session_proxy.py
+index a63a6d55..fd38e23a 100644
+--- a/src/polar/xyne/session_proxy.py
++++ b/src/polar/xyne/session_proxy.py
+@@ -52,9 +52,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from typing import Any
+ 
+ PROXY_HOST = "127.0.0.1"
+-PROXY_PORT = 18100
++# TEST-STACK isolation: prod backend often keeps LITELLM_BASE_URL=:18100.
++# Bind the Polar TEST session proxy on :18113 → gateway :8181 so prod traffic
++# on :18100 cannot starve the shared grid quota / test gateway.
++PROXY_PORT = 18113
+ UPSTREAM_HOST = "127.0.0.1"
+-UPSTREAM_PORT = 8100
++UPSTREAM_PORT = 8101
+ 
+ ROUTES_PATH = "/tmp/polar_session_routes.json"
+ LOCK_PATH = "/tmp/polar_session_routes.lock"
+@@ -158,7 +161,14 @@ def resolve_session_id(
+     return _single_surviving_session_id(rr)
+ # ---- HTTP server (SSE synthesis + forwarding) ----
+ def synth_sse(body: bytes) -> bytes | None:
+-    """Convert a non-stream chat.completion JSON body into an SSE byte stream. None on failure."""
++    """Convert a non-stream chat.completion JSON body into an SSE byte stream. None on failure.
++
++    Must forward ``message.tool_calls`` as ``delta.tool_calls`` chunks. Xyne's
++    ``@earendil-works/pi-ai`` openai-completions parser only materializes
++    ``toolCall`` content blocks from streaming tool deltas; omitting them leaves
++    ``stopReason=toolUse`` with an empty tool list, so Vespa never runs and
++    ``/dump.toolCalls`` stays empty.
++    """
+     try:
+         j = json.loads(body.decode('utf-8', 'replace'))
+         ch = (j.get('choices') or [{}])[0]
+@@ -180,6 +190,34 @@ def synth_sse(body: bytes) -> bytes | None:
+         c = dict(base)
+         c['choices'] = [{'index': 0, 'delta': {'role': 'assistant', 'content': txt}, 'finish_reason': None}]
+         out += ('data: ' + json.dumps(c, ensure_ascii=False) + '\n\n').encode()
++        # Mirror gateway ``_response_to_stream_chunk``: emit indexed tool_calls
++        # before the finish_reason chunk so pi-ai can build toolCall blocks.
++        tool_calls = msg.get('tool_calls') or []
++        if tool_calls:
++            tcs = []
++            for i, tc in enumerate(tool_calls):
++                if not isinstance(tc, dict):
++                    continue
++                func = tc.get('function') or {}
++                if not isinstance(func, dict):
++                    func = {}
++                tcs.append({
++                    'index': i,
++                    'id': tc.get('id'),
++                    'type': tc.get('type', 'function'),
++                    'function': {
++                        'name': func.get('name', '') or '',
++                        'arguments': func.get('arguments', '') or '',
++                    },
++                })
++            if tcs:
++                c = dict(base)
++                c['choices'] = [{
++                    'index': 0,
++                    'delta': {'role': 'assistant', 'tool_calls': tcs},
++                    'finish_reason': None,
++                }]
++                out += ('data: ' + json.dumps(c, ensure_ascii=False) + '\n\n').encode()
+         fin = ch.get('finish_reason') or 'stop'
+         c = dict(base)
+         c['choices'] = [{'index': 0, 'delta': {}, 'finish_reason': fin}]
+@@ -207,9 +245,27 @@ class H(BaseHTTPRequestHandler):
+             try:
+                 pj = json.loads(b.decode('utf-8', 'replace'))
+                 want_stream = bool(pj.get('stream'))
++                rewritten = False
+                 if want_stream:
+                     pj['stream'] = False
+                     pj.pop('stream_options', None)
++                    rewritten = True
++                # Unbounded / huge max_tokens wedges SGLang (health OK, chat hangs).
++                mt = pj.get('max_tokens')
++                if mt is None or mt == '' or (isinstance(mt, (int, float)) and int(mt) <= 0):
++                    mct = pj.get('max_completion_tokens')
++                    if mct not in (None, '') and int(mct) > 0:
++                        pj['max_tokens'] = int(mct)
++                    else:
++                        pj["max_tokens"] = 16384
++                    rewritten = True
++                try:
++                    if int(pj.get("max_tokens") or 0) > 16384:
++                        pj["max_tokens"] = 16384
++                        rewritten = True
++                except (TypeError, ValueError):
++                    pass
++                if rewritten:
+                     b = json.dumps(pj).encode()
+             except Exception:
+                 want_stream = False
+@@ -221,7 +277,7 @@ class H(BaseHTTPRequestHandler):
+             self.end_headers()
+             self.wfile.write(b'no Polar session matched')
+             return
+-        u = 'http://127.0.0.1:8100' + self.path
++        u = f'http://{UPSTREAM_HOST}:{UPSTREAM_PORT}' + self.path
+         r = urllib.request.Request(u, data=b, method=self.command)
+         if b is not None:
+             r.add_header('Content-Length', str(len(b)))
+@@ -233,7 +289,7 @@ class H(BaseHTTPRequestHandler):
+             r.add_header('authorization', 'Bearer ' + sid)
+             r.add_header('x-session-id', sid)
+         try:
+-            with urllib.request.urlopen(r, timeout=600) as resp:
++            with urllib.request.urlopen(r, timeout=7200) as resp:
+                 body = resp.read()
+                 if want_stream and self.path.rstrip('/').endswith('/v1/chat/completions'):
+                     sse = synth_sse(body)
+@@ -269,7 +325,7 @@ class H(BaseHTTPRequestHandler):
+         pass
+ 
+ def _serve() -> None:
+-    ThreadingHTTPServer(('127.0.0.1', 18100), H).serve_forever()
++    ThreadingHTTPServer((PROXY_HOST, PROXY_PORT), H).serve_forever()
+ 
+ if __name__ == '__main__':
+     _serve()
+diff --git a/src/polar/xyne/types.py b/src/polar/xyne/types.py
+index 2e803ae4..80466b20 100644
+--- a/src/polar/xyne/types.py
++++ b/src/polar/xyne/types.py
+@@ -25,6 +25,7 @@ CITATION_FIELDS = (
+     "chunkIndex",
+     "relevance",
+     "snippet",
++    "source_text",
+ )
+ 
+ _REQUIRED_FIELDS = ("conversation_id", "run_id", "request_messages", "answer")
+@@ -47,6 +48,21 @@ class XyneRawFlow:
+     llm_calls: int = 0
+     finish_reason: str | None = None
+     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
++    # Real-time dump fields (mapped first-class instead of falling into `extras`).
++    tool_calls: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    tool_use_blocks: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    tool_result_blocks: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    # Normalized, one-record-per-call telemetry. This remains useful when the
++    # backend stores a tool result in /dump.toolCalls but omits a message block.
++    tool_events: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    # Retrieved source records are kept separate from answer citations: a tool
++    # can retrieve a chunk without the assistant citing it in the final answer.
++    retrieved_chunks: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    sub_agents: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    thinking: list[str] = dataclasses.field(default_factory=list)
++    messages: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    runs: list[dict[str, Any]] = dataclasses.field(default_factory=list)
++    token_usage: dict[str, Any] = dataclasses.field(default_factory=dict)
+     extras: dict[str, Any] = dataclasses.field(default_factory=dict)
+ 
+     def to_dict(self) -> dict[str, Any]:
+diff --git a/src/polar/xyne/xyne_fetch_flow.py b/src/polar/xyne/xyne_fetch_flow.py
+index 086fab92..03c64fda 100644
+--- a/src/polar/xyne/xyne_fetch_flow.py
++++ b/src/polar/xyne/xyne_fetch_flow.py
+@@ -1,53 +1,45 @@
+ #!/usr/bin/env python3
+ """Standalone fetcher that drives one agentic Xyne run and writes a raw-flow JSON.
+ 
+-This script runs INSIDE the Xyne runtime (uploaded by a Polar PrepareAction or
+-rendered by ``XyneHarness`` into the runtime). It performs the full HTTP
+-orchestration against Xyne's live HTTP API and writes the observable artifacts
+-of one run to a single JSON file.
+-
+-Orchestration (all against the Xyne backend, default port 3000):
+-
+-  1. POST /v2/chat/conversations                      -> conversation_id
+-  2. POST /v2/chat/conversations/:id/messages         -> answer + run_id
+-  3. GET  /v2/chat/conversations/:id/debug-events     -> debug_events
+-  4. nested runs (sub-agent tree), taken from the debug-event payload when the
+-     backend exposes it (empty list otherwise).
+-
+-The emitted JSON uses EXACTLY the field names of ``polar.xyne.types.XyneRawFlow``
+-(conversation_id, run_id, request_messages, answer, citations, debug_events,
+-nested_runs, error, latency_ms, wall_clock_ms, llm_calls, finish_reason,
+-metadata). The harness reads it back and injects it into the trajectory.
+-
+-Notes:
+-
+-- The script is intentionally STANDALONE (stdlib only: urllib/json/argparse).
+-  It must never import ``polar.*`` or ``httpx`` because it runs inside the
+-  runtime image, which does not share the Polar venv.
+-- It NEVER talks to an LLM itself. Xyne's own OpenAI-compatible LLM call flows
+-  through Polar's gateway proxy (LITELLM_BASE_URL pointed at the gateway), which
+-  transparently captures completions. This script only orchestrates HTTP calls
+-  to Xyne's HTTP API.
+-- Every instance writes a JSON file to --output even on failure (with ``error``
+-  set), so the harness/evaluator can faithfully record low/zero-quality runs
+-  (e.g. empty retrieval -> static fallback where the LLM is never called).
++Standalone (stdlib only). Orchestrates HTTP calls against the Xyne backend
++(``/v2/chat/*``), authenticating with a JWT access-token cookie (the backend's
++AuthMiddleware validates ``access-token``; x-api-key alone is not accepted).
++
++The agentic answer runs asynchronously: ``POST /conversations/:id/messages``
++returns a runId immediately while the turn continues in the background, so this
++fetcher polls ``GET /conversations/:id/messages`` until the assistant final
++answer appears, then extracts it.
++
++The backend never sees the LLM directly through this script: Xyne's own
++LiteLLM call (``LITELLM_BASE_URL``) flows through Polar's gateway proxy, which
++captures the completions that build the trajectory.
++
++Emitted keys match ``polar.xyne.types.XyneRawFlow`` exactly.
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
++import html
+ import json
+ import os
++import re
+ import time
+ import urllib.error
+ import urllib.parse
+ import urllib.request
++import unicodedata
+ from typing import Any
+ 
+-# Emitted keys must match polar.xyne.types.XyneRawFlow field names.
+ _HEALTH_PATH = "/v2/health"
+ _CONVERSATIONS_PATH = "/v2/chat/conversations"
+ _DEBUG_EVENTS_PATH = "/v2/chat/conversations/{conversation_id}/debug-events"
++_NESTED_RUNS_PATH = "/v2/chat/conversations/{conversation_id}/runs/{parent_run_id}/nested"
++_DUMP_PATH = "/v2/chat/conversations/{conversation_id}/dump"
++_ACCESS_COOKIE = "access-token"
++
++_POLL_INTERVAL_S = 2.0
++_POLL_TIMEOUT_S = float(os.environ.get("XYNE_POLL_TIMEOUT_SECONDS", "1800"))
+ 
+ 
+ def _http_json(
+@@ -55,13 +47,16 @@ def _http_json(
+     url: str,
+     *,
+     api_key: str | None = None,
++    access_token: str | None = None,
+     payload: dict[str, Any] | None = None,
+     timeout: float = 30.0,
+-) -> tuple[int, dict[str, Any] | None]:
++) -> tuple[int, Any]:
+     """Perform one HTTP request and return (status, parsed-JSON-or-None)."""
+     data: bytes | None = None
+     headers: dict[str, str] = {"Accept": "application/json"}
+-    if api_key:
++    if access_token:
++        headers["Cookie"] = f"{_ACCESS_COOKIE}={access_token}"
++    elif api_key:
+         headers["x-api-key"] = api_key
+     if payload is not None:
+         data = json.dumps(payload).encode("utf-8")
+@@ -72,12 +67,11 @@ def _http_json(
+         with urllib.request.urlopen(request, timeout=timeout) as response:
+             status = int(response.getcode())
+             body = response.read().decode("utf-8", errors="replace")
+-            parsed: dict[str, Any] | None = None
++            parsed: Any = None
+             if body.strip():
+                 parsed = json.loads(body)
+             return status, parsed
+     except urllib.error.HTTPError as exc:
+-        # Best-effort parse of error bodies so we can surface server messages.
+         try:
+             parsed = json.loads(exc.read().decode("utf-8", errors="replace"))
+         except (ValueError, OSError):
+@@ -91,53 +85,73 @@ def _request_messages(instruction: str) -> list[dict[str, Any]]:
+     return [{"role": "user", "content": instruction}]
+ 
+ 
+-def _extract_nested_runs(debug_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+-    """Pull nested runs out of a debug-events payload if the backend exposes them.
+-
+-    Checks top-level ``nested_runs``/``nestedRuns``/``runs`` keys first, then
+-    falls back to scanning any ``events``/``debugEvents`` array. Results from
+-    both sources are combined (deduplicated by ``runId``/``id`` when present).
+-    """
+-    if not isinstance(debug_payload, dict):
++def _as_items(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
++    if not isinstance(payload, dict):
+         return []
+-    combined: list[dict[str, Any]] = []
+-    seen: list[Any] = []
+-
+-    for key in ("nested_runs", "nestedRuns", "runs"):
+-        value = debug_payload.get(key)
++    for key in ("items", "messages"):
++        value = payload.get(key)
+         if isinstance(value, list):
+-            for run in value:
+-                if isinstance(run, dict):
+-                    combined.append(run)
+-
+-    for key in ("events", "debugEvents"):
+-        value = debug_payload.get(key)
+-        if isinstance(value, list):
+-            combined.extend(_extract_nested_runs_from_events(value))
+-
+-    deduped: list[dict[str, Any]] = []
+-    for run in combined:
+-        identifier = run.get("runId", run.get("id", run.get("run_id")))
+-        if identifier is not None and identifier in seen:
+-            continue
+-        if identifier is not None:
+-            seen.append(identifier)
+-        deduped.append(run)
+-    return deduped
++            return [v for v in value if isinstance(v, dict)]
++    return []
++
++
++def _text_of(block: Any) -> str:
++    if isinstance(block, dict):
++        if isinstance(block.get("text"), str):
++            return block["text"]
++        content = block.get("content")
++        if isinstance(content, list):
++            parts = []
++            for c in content:
++                if isinstance(c, dict) and isinstance(c.get("text"), str):
++                    parts.append(c["text"])
++                elif isinstance(c, str):
++                    parts.append(c)
++            return "".join(parts)
++        if isinstance(content, str):
++            return content
++    return ""
++
++
++def _item_text(item: dict[str, Any] | None) -> str:
++    if not item:
++        return ""
++    direct = item.get("text")
++    if isinstance(direct, str):
++        return direct
++    content = item.get("content")
++    if isinstance(content, str):
++        return content
++    blocks = item.get("blocks")
++    if isinstance(blocks, list):
++        return "".join(_text_of(b) for b in blocks)
++    if isinstance(content, list):
++        return "".join(
++            _text_of(c) for c in content if isinstance(c, dict) or isinstance(c, str)
++        )
++    return ""
+ 
+ 
+-def _extract_nested_runs_from_events(
+-    events: list[Any],
+-) -> list[dict[str, Any]]:
+-    runs: list[dict[str, Any]] = []
+-    for event in events:
+-        if not isinstance(event, dict):
++def _final_assistant_answer(items: list[dict[str, Any]]) -> tuple[str, str]:
++    """Return (answer_text, assistant_message_id) for the last complete assistant msg."""
++    answer = ""
++    msg_id = ""
++    for item in items:
++        if item.get("role") != "assistant":
+             continue
+-        for key in ("nested_runs", "nestedRuns", "runs", "subRuns"):
+-            value = event.get(key)
+-            if isinstance(value, list):
+-                runs.extend(v for v in value if isinstance(v, dict))
+-    return runs
++        blocks = item.get("blocks")
++        if isinstance(blocks, list):
++            text = "".join(
++                block.get("text", "")
++                for block in blocks
++                if isinstance(block, dict) and block.get("kind") == "text"
++            )
++        else:
++            text = _item_text(item)
++        if text.strip():
++            answer = text
++            msg_id = str(item.get("id") or "")
++    return answer, msg_id
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+@@ -162,13 +176,24 @@ def main(argv: list[str] | None = None) -> int:
+     parser.add_argument(
+         "--api-key",
+         default=os.environ.get("XYNE_API_KEY", ""),
+-        help="API key sent as the x-api-key header (default: XYNE_API_KEY env).",
++        help="Legacy x-api-key header (fallback when no access-token).",
++    )
++    parser.add_argument(
++        "--access-token",
++        default=os.environ.get("XYNE_ACCESS_TOKEN", ""),
++        help="JWT access token sent as the access-token cookie.",
++    )
++    parser.add_argument(
++        "--agent-id",
++        default=os.environ.get("XYNE_AGENT_ID", ""),
++        help="Xyne agent external ID to run (required for agent-scoped tools).",
+     )
+     parser.add_argument(
+         "--timeout", type=float, default=30.0, help="Per-request timeout seconds."
+     )
+     args = parser.parse_args(argv)
+ 
++    access_token = args.access_token or None
+     api_key = args.api_key or None
+     base_url = args.base_url.rstrip("/")
+     wall_start = time.monotonic()
+@@ -179,14 +204,15 @@ def main(argv: list[str] | None = None) -> int:
+         "request_messages": _request_messages(args.instruction),
+         "answer": "",
+         "citations": [],
++        "finish_reason": None,
+         "debug_events": [],
+         "nested_runs": [],
+         "error": None,
+         "latency_ms": 0.0,
+         "wall_clock_ms": 0.0,
+-        "llm_calls": 0,
+-        "finish_reason": None,
+         "metadata": {},
++        "tool_events": [],
++        "retrieved_chunks": [],
+     }
+ 
+     # 1. Create the conversation.
+@@ -194,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
+         "POST",
+         f"{base_url}{_CONVERSATIONS_PATH}",
+         api_key=api_key,
++        access_token=access_token,
+         payload={"messages": flow["request_messages"]},
+         timeout=args.timeout,
+     )
+@@ -202,110 +229,783 @@ def main(argv: list[str] | None = None) -> int:
+             f"create conversation failed (status={status}): "
+             f"{_safe(conversation)}"
+         )
+-        return _finish(flow, wall_start, args.output, failure=True)
++        return _finish(flow, wall_start, args.output)
+ 
+-    conversation_id = str(conversation.get("id") or conversation.get("conversation_id") or "")
++    conversation_id = (
++        str(conversation.get("id") or conversation.get("conversation_id") or "")
++    )
+     flow["conversation_id"] = conversation_id
+     if not conversation_id:
+         flow["error"] = f"create conversation returned no id: {_safe(conversation)}"
+-        return _finish(flow, wall_start, args.output, failure=True)
++        return _finish(flow, wall_start, args.output)
+ 
+-    # 2. Send the instruction and receive the agentic answer + run_id.
++    # 2. Send the instruction and start the agentic turn.
+     message_path = f"{base_url}{_CONVERSATIONS_PATH}/{conversation_id}/messages"
+     send_start = time.monotonic()
+     status, answer_payload = _http_json(
+         "POST",
+         message_path,
+         api_key=api_key,
+-        payload={"messages": flow["request_messages"]},
++        access_token=access_token,
++        payload={
++            "text": args.instruction,
++            "debug": True,
++            "debugVerbosity": "detailed",
++            **({"agentId": args.agent_id} if args.agent_id else {}),
++        },
+         timeout=args.timeout,
+     )
+-    latency_ms = (time.monotonic() - send_start) * 1000.0
+-    flow["latency_ms"] = latency_ms
++    flow["latency_ms"] = (time.monotonic() - send_start) * 1000.0
+ 
+     if not isinstance(answer_payload, dict) or status >= 400:
+         flow["error"] = (
+             f"send message failed (status={status}): {_safe(answer_payload)}"
+         )
+-        return _finish(flow, wall_start, args.output, failure=True)
++        return _finish(flow, wall_start, args.output)
+ 
+-    run_id = str(
+-        answer_payload.get("runId")
+-        or answer_payload.get("run_id")
+-        or answer_payload.get("id")
+-        or ""
+-    )
+-    flow["run_id"] = run_id
+-    answer = answer_payload.get("answer")
+-    if isinstance(answer, str):
+-        flow["answer"] = answer
+-    elif isinstance(answer, dict) and isinstance(answer.get("content"), str):
+-        flow["answer"] = answer["content"]
++    # runId surfaced on the assistantMessage of the async start response.
++    am = answer_payload.get("assistantMessage")
++    if isinstance(am, dict):
++        run_id = am.get("runId") or am.get("run_id") or am.get("id")
++    else:
++        run_id = answer_payload.get("runId") or answer_payload.get("run_id")
++    flow["run_id"] = str(run_id or "")
+ 
+-    citations = answer_payload.get("citations")
+-    if isinstance(citations, list):
+-        flow["citations"] = [c for c in citations if isinstance(c, dict)]
++    citations = []
++    for src in (answer_payload.get("citations"), (am or {}).get("citations")):
++        if isinstance(src, list):
++            citations.extend(c for c in src if isinstance(c, dict))
++    flow["citations"] = citations
+ 
+     finish_reason = answer_payload.get("finishReason", answer_payload.get("finish_reason"))
+     if isinstance(finish_reason, str):
+         flow["finish_reason"] = finish_reason
+ 
+-    # 3. Fetch debug events (with runId when available).
+-    debug_status = 0
+-    debug_payload: dict[str, Any] | None = None
++    # 3. Wait for the async agentic turn to produce the assistant's final answer.
++    items: list[dict[str, Any]] = []
++    answer, ans_msg_id = "", ""
++    poll_start = time.monotonic()
++    while time.monotonic() - poll_start < _POLL_TIMEOUT_S:
++        time.sleep(_POLL_INTERVAL_S)
++        st, msgs = _http_json(
++            "GET", message_path, api_key=api_key, access_token=access_token,
++            timeout=args.timeout,
++        )
++        if st < 400:
++            items = _as_items(msgs)
++            answer, ans_msg_id = _final_assistant_answer(items)
++            # Fast-fail: once the backend has terminated the turn (timeout
++            # / failure), the conversation rows stop growing and the run/turn
++            # status flips terminal but never gains an assistant text. Poll
++            # /dump once per iteration and short-circuit after ~3 consecutive
++            # dead-turn confirmations instead of burning the full poll window.
++            _dead_probe = 0
++            if not answer:
++                try:
++                    _tb = _fetch_dump(
++                        base_url, conversation_id, api_key, access_token,
++                        timeout=args.timeout,
++                    )
++                    if _tb and _main_run_terminal(_tb, flow["run_id"]):
++                        if _main_assistant_answer(_tb)[0]:
++                            answer, ans_msg_id = _main_assistant_answer(_tb)
++                        else:
++                            flow["error"] = (
++                                flow["error"]
++                                or "turn terminated by backend with no "
++                                   "assistant answer (timeout/failed)"
++                            )
++                            break
++                except Exception:
++                    pass
++            if answer:
++                # First assistant text is often a planning line ("I'll search…")
++                # before tools run. Only stop once /dump says the main run is
++                # terminal; otherwise keep polling so toolCalls land in the dump.
++                try:
++                    candidate_dump = _fetch_dump(
++                        base_url, conversation_id, api_key, access_token,
++                        timeout=args.timeout,
++                    )
++                except Exception:
++                    candidate_dump = None
++                if candidate_dump and _main_run_terminal(
++                    candidate_dump, flow["run_id"]
++                ):
++                    dump_answer, dump_msg_id = _main_assistant_answer(
++                        candidate_dump
++                    )
++                    if dump_answer:
++                        answer, ans_msg_id = dump_answer, dump_msg_id
++                    break
++    flow["metadata"]["messages"] = items
++    if not answer:
++        flow["error"] = (
++            flow["error"]
++            or f"no final answer within {int(_POLL_TIMEOUT_S)}s "
++            f"(conversation={conversation_id}, run={flow['run_id']})"
++        )
++    else:
++        flow["answer"] = answer
++        flow["metadata"]["assistant_message_id"] = ans_msg_id
++
++    # 4. Fetch debug events (empty when the backend does not expose them).
+     debug_url = (
+         f"{base_url}{_DEBUG_EVENTS_PATH.format(conversation_id=conversation_id)}"
+     )
+-    if run_id:
+-        debug_url += f"?runId={urllib.parse.quote(run_id)}"
++    if flow["run_id"]:
++        debug_url += f"?runId={urllib.parse.quote(flow['run_id'])}"
+     debug_status, debug_payload = _http_json(
+-        "GET", debug_url, api_key=api_key, timeout=args.timeout
++        "GET", debug_url, api_key=api_key, access_token=access_token,
++        timeout=args.timeout,
+     )
+-    if debug_status >= 400:
+-        flow["error"] = (
+-            flow["error"]
+-            or f"fetch debug-events failed (status={debug_status}): {_safe(debug_payload)}"
+-        )
+-    else:
+-        events = debug_payload.get("events") if isinstance(debug_payload, dict) else None
++    if 0 < debug_status < 400 and isinstance(debug_payload, dict):
++        events = debug_payload.get("events")
+         if isinstance(events, list):
+             flow["debug_events"] = [e for e in events if isinstance(e, dict)]
+ 
+-    # 4. Nested runs (sub-agent tree) from the debug payload when present.
+     flow["nested_runs"] = _extract_nested_runs(debug_payload)
+ 
+-    return _finish(flow, wall_start, args.output, failure=False)
++    if flow["run_id"]:
++        # debug-events does not carry the sub-agent tree; hit the M8 endpoint.
++        nested_url = (
++            f"{base_url}"
++            f"{_NESTED_RUNS_PATH.format(conversation_id=conversation_id, parent_run_id=urllib.parse.quote(flow['run_id']))}"
++        )
++        nested_status, nested_payload = _http_json(
++            "GET", nested_url, api_key=api_key, access_token=access_token,
++            timeout=args.timeout,
++        )
++        if 0 < nested_status < 400:
++            if isinstance(nested_payload, dict):
++                nested_payload = nested_payload.get("nestedRuns", [])
++            if isinstance(nested_payload, list):
++                flow["nested_runs"] = [
++                    e for e in nested_payload if isinstance(e, dict)
++                ]
++
++    # 5. Fetch the full-turn DB dump and assemble one unified result object.
++    dump = _fetch_dump(
++        base_url, conversation_id, api_key, access_token, timeout=args.timeout
++    )
++    if not dump:
++        # Some Xyne deployments do not expose the DB dump route. The messages
++        # endpoint still contains the complete assistant blocks, including
++        # thinking, tool_use, tool_result and final text.
++        dump = {"messages": items, "runs": [], "toolCalls": []}
++        flow["metadata"]["dump_source"] = "messages_fallback"
++    unified = _build_unified_result(
++        dump,
++        flow["debug_events"],
++        flow["nested_runs"],
++        initial_citations=flow["citations"],
++    )
++    flow.update(unified)
++
++    # Incomplete agentic: model signaled toolUse / finish_reason=tool_calls but
++    # the dump has no executed tools (and usually only a planning stub answer).
++    # Mark as error so the evaluator failure-gates instead of scoring the stub.
++    incomplete = _incomplete_tool_use(flow)
++    if incomplete:
++        flow["error"] = flow.get("error") or incomplete
++        flow["finish_reason"] = flow.get("finish_reason") or "toolUse"
++        flow.setdefault("metadata", {})["incomplete_agentic"] = incomplete
++
++    return _finish(flow, wall_start, args.output)
++
++
++def _incomplete_tool_use(flow: dict[str, Any]) -> str | None:
++    """Return an error string when stopReason is toolUse but no tools ran."""
++    if flow.get("tool_calls") or flow.get("tool_use_blocks"):
++        return None
++    dump = flow.get("raw_dump")
++    if isinstance(dump, dict):
++        tcs = dump.get("toolCalls")
++        if isinstance(tcs, list) and tcs:
++            return None
++    stop: str | None = None
++    for event in flow.get("debug_events") or []:
++        if not isinstance(event, dict):
++            continue
++        raw = event.get("stopReason") or event.get("finish_reason")
++        if isinstance(raw, str) and raw.strip():
++            stop = raw.strip()
++    if not stop:
++        return None
++    normalized = stop.replace("_", "").casefold()
++    if normalized in {"tooluse", "toolcalls"}:
++        return (
++            f"incomplete agentic: stopReason={stop} but toolCalls empty "
++            "(LLM requested tools; backend did not persist/execute them)"
++        )
++    return None
+ 
+ 
+-def _finish(
+-    flow: dict[str, Any],
+-    wall_start: float,
+-    output: str,
+-    *,
+-    failure: bool,
+-) -> int:
+-    flow["wall_clock_ms"] = (time.monotonic() - wall_start) * 1000.0
+-    if flow["answer"] and flow["error"] is None and flow["llm_calls"] == 0:
+-        # We cannot observe the LLM call count via the HTTP API; Xyne's LLM
+-        # calls are captured by Polar's gateway, not here. Keep llm_calls as an
+-        # opaque count field (defaults 0); the evaluator reads the real traces.
+-        pass
+-    del failure  # _finish always writes a flow, even on failure.
+-    _write_output(output, flow)
+-    return 0
++def _extract_nested_runs(debug_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
++    if not isinstance(debug_payload, dict):
++        return []
++    combined: list[dict[str, Any]] = []
++    for key in ("nested_runs", "nestedRuns", "runs"):
++        value = debug_payload.get(key)
++        if isinstance(value, list):
++            combined.extend(v for v in value if isinstance(v, dict))
++    # The sub-agent tree is also exposed per tool-call event; the debug-events
++    # payload carries it under each event's nestedRuns/nested_runs/runs/subRuns.
++    for key in ("events", "debugEvents"):
++        value = debug_payload.get(key)
++        if isinstance(value, list):
++            combined.extend(_extract_nested_runs_from_events(value))
++    return combined
+ 
+ 
+-def _write_output(output: str, flow: dict[str, Any]) -> None:
++def _extract_nested_runs_from_events(events: list[Any]) -> list[dict[str, Any]]:
++    runs: list[dict[str, Any]] = []
++    for event in events:
++        if not isinstance(event, dict):
++            continue
++        for key in ("nested_runs", "nestedRuns", "runs", "subRuns"):
++            value = event.get(key)
++            if isinstance(value, list):
++                runs.extend(v for v in value if isinstance(v, dict))
++    return runs
++
++
++def _fetch_dump(
++    base_url: str,
++    conversation_id: str,
++    api_key: str | None,
++    access_token: str | None,
++    timeout: float,
++) -> dict[str, Any]:
++    """Fetch the full-turn DB snapshot via GET /v2/chat/conversations/:id/dump.
++
++    Response shape: ``{conversation, messages, runs, toolCalls}``. Returns the
++    parsed dict (``{}`` on any transport/HTTP failure) with dictionary-style
++    access via ``.get()`` so downstream extraction is defensive.
++    """
++    if not conversation_id:
++        return {}
++    dump_url = f"{base_url}{_DUMP_PATH.format(conversation_id=conversation_id)}"
++    status, dump_payload = _http_json(
++        "GET", dump_url, api_key=api_key, access_token=access_token, timeout=timeout
++    )
++    if 0 < status < 400 and isinstance(dump_payload, dict):
++        return dump_payload
++    return {}
++
++
++def _main_run_terminal(dump: dict[str, Any], run_id: str) -> bool:
++    """Return whether the main run is terminal in a dump snapshot."""
++    runs = dump.get("runs")
++    if not isinstance(runs, list):
++        return True
++    matching = [
++        run for run in runs
++        if isinstance(run, dict) and (not run_id or run.get("id") == run_id)
++    ]
++    if not matching:
++        return True
++    terminal = {"completed", "failed", "cancelled", "canceled", "error", "aborted"}
++    for run in matching:
++        status = run.get("status")
++        if status is None:
++            continue
++        return str(status).lower() in terminal
++    # Legacy dump versions omit status; their assistant message is the only
++    # completion signal available, so preserve the old behavior.
++    return True
++
++
++def _main_assistant_answer(dump: dict[str, Any]) -> tuple[str, str]:
++    """Return the last persisted text answer from a main-run assistant message."""
++    messages = [m for m in dump.get("messages", []) if isinstance(m, dict)]
++    runs = [r for r in dump.get("runs", []) if isinstance(r, dict)]
++    nested_run_ids = {run.get("id") for run in runs if run.get("parentRunId")}
++    answer = ""
++    message_id = ""
++
++    for message in messages:
++        if message.get("role") != "assistant":
++            continue
++        if message.get("runId") in nested_run_ids:
++            continue
++        blocks = message.get("blocks")
++        if not isinstance(blocks, list):
++            continue
++        text = "".join(
++            block.get("text", "")
++            for block in blocks
++            if isinstance(block, dict) and block.get("kind") == "text"
++        )
++        if text.strip():
++            answer = text
++            message_id = str(message.get("id") or "")
++
++    return answer, message_id
++
++
++def _build_unified_result(
++    dump: dict[str, Any],
++    debug_events: list[dict[str, Any]],
++    nested_runs: list[dict[str, Any]],
++    initial_citations: list[dict[str, Any]] | None = None,
++) -> dict[str, Any]:
++    """Assemble one unified result object from the /dump snapshot plus supplements."""
++    messages = [
++        m for m in dump.get("messages", []) if isinstance(m, dict)
++    ]
++    runs = [r for r in dump.get("runs", []) if isinstance(r, dict)]
++    tool_calls_raw = [
++        t for t in dump.get("toolCalls", []) if isinstance(t, dict)
++    ]
++    nested_run_ids = {run.get("id") for run in runs if run.get("parentRunId")}
++
++    def _blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
++        blocks = msg.get("blocks")
++        if isinstance(blocks, list):
++            return [b for b in blocks if isinstance(b, dict)]
++        content = msg.get("content")
++        if isinstance(content, list):
++            return [c for c in content if isinstance(c, dict)]
++        return []
++
++    all_blocks: list[dict[str, Any]] = []
++    for msg in messages:
++        all_blocks.extend(_blocks(msg))
++
++    # Answer: joined text blocks of the last MAIN-run assistant message.
++    answer = ""
++    for msg in messages:
++        if msg.get("role") != "assistant":
++            continue
++        if msg.get("runId") in nested_run_ids:
++            continue
++        text = "".join(
++            b.get("text", "") for b in _blocks(msg) if b.get("kind") == "text"
++        )
++        if text.strip():
++            answer = text
++    if not isinstance(answer, str):
++        answer = str(answer)
++
++    # Citations: preserve API-provided records first. Answer-text citations are
++    # resolved after retrieval evidence is normalized below, because the
++    # agentic UI emits human-readable ``[title.pdf · chunk:N]`` references
++    # rather than the legacy ``[docId#N]`` form.
++    seen: set[tuple[str, int]] = set()
++    citations: list[dict[str, Any]] = []
++
++    def _add_citation(doc_id: Any, chunk: Any, **extra: Any) -> None:
++        if not isinstance(doc_id, str) or not doc_id.strip():
++            return
++        try:
++            chunk_int = int(chunk)
++        except (TypeError, ValueError):
++            return
++        key = (doc_id, chunk_int)
++        if key in seen:
++            return
++        seen.add(key)
++        record: dict[str, Any] = {"docId": doc_id, "chunk": chunk_int}
++        record.update({k: v for k, v in extra.items() if v not in (None, "")})
++        citations.append(record)
++
++    for citation in initial_citations or []:
++        if isinstance(citation, dict):
++            _add_citation(
++                citation.get("docId") or citation.get("itemId"),
++                citation.get("chunk", citation.get("chunkIndex", citation.get("index"))),
++                **{
++                    k: citation.get(k)
++                    for k in ("itemId", "snippet", "source_text", "relevance")
++                },
++            )
++
++    # tool_calls from the dump.toolCalls[] array.
++    tool_calls: list[dict[str, Any]] = []
++    for tc in tool_calls_raw:
++        tool_calls.append(
++            {
++                "toolCallId": tc.get("toolCallId") or tc.get("id"),
++                "toolName": tc.get("toolName"),
++                "args": tc.get("args"),
++                "result": tc.get("result"),
++                "isError": tc.get("isError"),
++                "status": tc.get("status"),
++                "startedAt": tc.get("startedAt"),
++                "completedAt": tc.get("completedAt"),
++            }
++        )
++
++    # tool_use / tool_result / thinking blocks across all messages.
++    tool_use_blocks: list[dict[str, Any]] = []
++    tool_result_blocks: list[dict[str, Any]] = []
++    thinking: list[str] = []
++    for block in all_blocks:
++        kind = block.get("kind")
++        if kind == "tool_use":
++            tool_use_blocks.append(
++                {
++                    "toolCallId": block.get("toolCallId"),
++                    "toolName": block.get("toolName"),
++                    "args": block.get("args"),
++                }
++            )
++        elif kind == "tool_result":
++            tool_result_blocks.append(
++                {
++                    "toolCallId": block.get("toolCallId"),
++                    "output": block.get("output"),
++                    "isError": block.get("isError"),
++                }
++            )
++        elif kind == "thinking":
++            text = block.get("text")
++            if isinstance(text, str):
++                thinking.append(text)
++
++    # Some backend versions persist results in /dump.toolCalls but omit a
++    # message-level tool_result block. Synthesize only missing IDs so the
++    # result is still available to reward functions and diagnostics.
++    result_ids = {
++        item.get("toolCallId") for item in tool_result_blocks
++        if isinstance(item, dict) and item.get("toolCallId")
++    }
++    for item in tool_calls:
++        call_id = item.get("toolCallId")
++        if call_id and call_id not in result_ids and item.get("result") is not None:
++            tool_result_blocks.append(
++                {
++                    "toolCallId": call_id,
++                    "output": item.get("result"),
++                    "isError": item.get("isError"),
++                    "source": "dump.toolCalls",
++                }
++            )
++
++    if not tool_calls:
++        results_by_id = {
++            item.get("toolCallId"): item
++            for item in tool_result_blocks
++            if item.get("toolCallId")
++        }
++        for use in tool_use_blocks:
++            call_id = use.get("toolCallId")
++            result = results_by_id.get(call_id, {})
++            tool_calls.append(
++                {
++                    "toolCallId": call_id,
++                    "toolName": use.get("toolName"),
++                    "args": use.get("args"),
++                    "result": result.get("output"),
++                    "isError": result.get("isError"),
++                    "status": "completed" if result else "pending",
++                    "source": "message_blocks",
++                }
++            )
++
++    tool_events = [
++        {
++            "toolCallId": item.get("toolCallId"),
++            "toolName": item.get("toolName"),
++            "args": item.get("args"),
++            "result": item.get("result"),
++            "isError": item.get("isError"),
++            "status": item.get("status"),
++            "startedAt": item.get("startedAt"),
++            "completedAt": item.get("completedAt"),
++        }
++        for item in tool_calls
++    ]
++    retrieved_chunks = _extract_retrieved_chunks(tool_calls)
++    evidence_by_key = {
++        (item.get("docId"), item.get("chunk")): item
++        for item in retrieved_chunks
++        if item.get("docId") and item.get("chunk") is not None
++    }
++    evidence_by_title_chunk = {
++        (_title_key(item.get("title")), item.get("chunk")): item
++        for item in retrieved_chunks
++        if _title_key(item.get("title")) and item.get("chunk") is not None
++    }
++
++    # Only the final answer establishes a citation. Tool output and thinking
++    # often contain doc/chunk identifiers but must not receive citation credit.
++    for match in _CITE_TOKEN_RE.finditer(answer):
++        _add_citation(match.group(1), match.group(2))
++    for match in _TITLE_CITE_RE.finditer(answer):
++        title, chunk_text = match.group(1).strip(), match.group(2)
++        normalized_title = _title_key(title)
++        if re.fullmatch(r"clf-[a-z0-9]+", normalized_title):
++            _add_citation(normalized_title, chunk_text)
++            continue
++        evidence = evidence_by_title_chunk.get((_title_key(title), int(chunk_text)))
++        if evidence is None:
++            # Xyne sometimes renders only the basename while Vespa returns a
++            # folder-qualified title. Resolve a unique suffix match safely.
++            candidates = [
++                item
++                for (candidate_title, candidate_chunk), item in evidence_by_title_chunk.items()
++                if candidate_chunk == int(chunk_text)
++                and (
++                    candidate_title.endswith(_title_key(title))
++                    or _title_key(title).endswith(candidate_title)
++                )
++            ]
++            if len(candidates) == 1:
++                evidence = candidates[0]
++        if evidence is None:
++            # Descriptive citations such as ``Appeal No. 5940 of 2024`` do
++            # not reproduce the stored path. Match only when the citation's
++            # identifying numbers select one retrieved title at this chunk.
++            numbers = set(re.findall(r"\d+", normalized_title))
++            if numbers:
++                candidates = [
++                    item
++                    for (candidate_title, candidate_chunk), item in evidence_by_title_chunk.items()
++                    if candidate_chunk == int(chunk_text)
++                    and numbers <= set(re.findall(r"\d+", candidate_title))
++                ]
++                if len(candidates) == 1:
++                    evidence = candidates[0]
++        if evidence is not None:
++            _add_citation(
++                evidence.get("docId"),
++                evidence.get("chunk"),
++                title=evidence.get("title") or title,
++            )
++
++    for citation in citations:
++        evidence = evidence_by_key.get((citation.get("docId"), citation.get("chunk")))
++        if evidence:
++            for key in ("snippet", "source_text", "title", "relevance"):
++                if key not in citation and evidence.get(key) not in (None, ""):
++                    citation[key] = evidence[key]
++
++    # sub_agents: every run with a parentRunId, plus its run-scoped messages.
++    sub_agents: list[dict[str, Any]] = []
++    for run in runs:
++        if run.get("parentRunId"):
++            run_id = run.get("id")
++            run_messages = [
++                m for m in messages if m.get("runId") == run_id
++            ]
++            sub_agents.append({"run": run, "messages": run_messages})
++
++    # token_usage from the last MAIN-run assistant message's stats.tokenUsage.
++    token_usage: dict[str, Any] = {}
++    for msg in reversed(messages):
++        if msg.get("role") != "assistant":
++            continue
++        if msg.get("runId") in nested_run_ids:
++            continue
++        stats = msg.get("stats")
++        if isinstance(stats, dict) and isinstance(stats.get("tokenUsage"), dict):
++            token_usage = stats["tokenUsage"]
++        break
++
++    return {
++        "raw_dump": dump,
++        "answer": answer,
++        "citations": citations,
++        "tool_calls": tool_calls,
++        "tool_use_blocks": tool_use_blocks,
++        "tool_result_blocks": tool_result_blocks,
++        "tool_events": tool_events,
++        "retrieved_chunks": retrieved_chunks,
++        "sub_agents": sub_agents,
++        "thinking": thinking,
++        "messages": messages,
++        "runs": runs,
++        "token_usage": token_usage,
++        "debug_events": debug_events,
++        "nested_runs": nested_runs,
++    }
++
++
++_ATTR_RE = re.compile(r'''([A-Za-z_][A-Za-z0-9_-]*)="([^"]*)"''')
++_CHUNKS_TAG_RE = re.compile(
++    r"<chunks\b([^>]*)>(.*?)</chunks>", re.IGNORECASE | re.DOTALL
++)
++_CHUNK_TAG_RE = re.compile(
++    r"<chunk\b([^>]*)>(.*?)</chunk>", re.IGNORECASE | re.DOTALL
++)
++_HIT_TAG_RE = re.compile(r"<hit\b([^>]*)>(.*?)</hit>", re.IGNORECASE | re.DOTALL)
++_TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
++_CITE_TOKEN_RE = re.compile(r"\[([^#\]\s]+)#(\d+)\]")
++_TITLE_CITE_RE = re.compile(
++    r"\[([^\[\]]*?\S)\s*(?:·|\||–|—|-|\\,\\,|,)?\s*"
++    r"chunk\s*:?\s*(\d+)[^0-9\]]*\]",
++    re.IGNORECASE,
++)
++
++
++def _title_key(value: Any) -> str:
++    if not isinstance(value, str):
++        return ""
++    text = unicodedata.normalize("NFKC", html.unescape(value))
++    text = text.translate(str.maketrans({
++        "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-",
++    }))
++    text = text.replace("\\_", "_").replace("\\-", "-")
++    text = text.strip().strip("*`").strip()
++    return re.sub(r"\s+", " ", text).casefold()
++
++
++def _clean_retrieval_text(value: Any) -> str:
++    if not isinstance(value, str):
++        return ""
++    text = html.unescape(value)
++    text = re.sub(r"<[^>]+>", " ", text)
++    return re.sub(r"\s+", " ", text).strip()[:4000]
++
++
++def _extract_retrieved_chunks(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Normalize search/getChunks results into doc/chunk evidence records."""
++    records: list[dict[str, Any]] = []
++    seen: set[tuple[str, int]] = set()
++
++    def add(
++        doc_id: Any,
++        chunk: Any,
++        *,
++        snippet: Any = None,
++        title: Any = None,
++        relevance: Any = None,
++    ) -> None:
++        if not isinstance(doc_id, str) or not doc_id.strip():
++            return
++        try:
++            chunk_int = int(chunk)
++        except (TypeError, ValueError):
++            return
++        key = (doc_id, chunk_int)
++        cleaned = _clean_retrieval_text(snippet)
++        if key in seen:
++            current = next(
++                item for item in records
++                if (item.get("docId"), item.get("chunk")) == key
++            )
++            if cleaned and not current.get("snippet"):
++                current["snippet"] = cleaned
++                current["source_text"] = cleaned
++            return
++        seen.add(key)
++        item: dict[str, Any] = {"docId": doc_id, "chunk": chunk_int}
++        if cleaned:
++            item["snippet"] = cleaned
++            item["source_text"] = cleaned
++        if isinstance(title, str) and title.strip():
++            item["title"] = title.strip()[:500]
++        if isinstance(relevance, (int, float)):
++            item["relevance"] = max(0.0, min(1.0, float(relevance)))
++        elif isinstance(relevance, str):
++            try:
++                item["relevance"] = max(0.0, min(1.0, float(relevance)))
++            except ValueError:
++                pass
++        records.append(item)
++
++    def walk(value: Any, inherited_doc: str | None = None) -> None:
++        if isinstance(value, dict):
++            doc_id = value.get("docId") or value.get("doc_id") or inherited_doc
++            chunk = value.get("chunk")
++            if chunk is None:
++                chunk = value.get(
++                    "chunkIndex", value.get("chunk_index", value.get("index"))
++                )
++            if doc_id is not None and chunk is not None:
++                snippet = (
++                    value.get("snippet")
++                    or value.get("source_text")
++                    or value.get("text")
++                )
++                add(
++                    doc_id,
++                    chunk,
++                    snippet=snippet,
++                    title=value.get("title"),
++                    relevance=value.get("score"),
++                )
++            for child in value.values():
++                walk(child, str(doc_id) if doc_id else inherited_doc)
++            return
++        if isinstance(value, list):
++            for child in value:
++                walk(child, inherited_doc)
++            return
++        if not isinstance(value, str):
++            return
++
++        for match in _CHUNKS_TAG_RE.finditer(value):
++            outer_attrs = dict(_ATTR_RE.findall(match.group(1)))
++            body = match.group(2)
++            outer_doc = outer_attrs.get("docId") or outer_attrs.get("doc_id") or inherited_doc
++            title_match = _TITLE_TAG_RE.search(body)
++            title = _clean_retrieval_text(title_match.group(1)) if title_match else None
++            for chunk_match in _CHUNK_TAG_RE.finditer(body):
++                attrs = dict(_ATTR_RE.findall(chunk_match.group(1)))
++                cite = _CITE_TOKEN_RE.search(attrs.get("cite", ""))
++                doc_id = (cite.group(1) if cite else None) or outer_doc
++                chunk = (
++                    (cite.group(2) if cite else None)
++                    or attrs.get("chunk_index")
++                    or attrs.get("index")
++                )
++                add(
++                    doc_id,
++                    chunk,
++                    snippet=chunk_match.group(2),
++                    title=title,
++                    relevance=attrs.get("score"),
++                )
++
++        for match in _HIT_TAG_RE.finditer(value):
++            attrs = dict(_ATTR_RE.findall(match.group(1)))
++            body = match.group(2)
++            title_match = _TITLE_TAG_RE.search(body)
++            title = _clean_retrieval_text(title_match.group(1)) if title_match else None
++            add(
++                attrs.get("docId") or attrs.get("doc_id") or inherited_doc,
++                attrs.get("chunk_index", attrs.get("chunkIndex", attrs.get("index"))),
++                snippet=body,
++                title=title,
++                relevance=attrs.get("score"),
++            )
++
++        for match in _CHUNK_TAG_RE.finditer(value):
++            attrs = dict(_ATTR_RE.findall(match.group(1)))
++            body = _clean_retrieval_text(match.group(2))
++            cite = _CITE_TOKEN_RE.search(attrs.get("cite", ""))
++            doc_id = (cite.group(1) if cite else None) or inherited_doc
++            chunk = (
++                (cite.group(2) if cite else None)
++                or attrs.get("chunk_index")
++                or attrs.get("index")
++            )
++            if doc_id and chunk is not None:
++                add(doc_id, chunk, snippet=body, relevance=attrs.get("score"))
++        for match in _CITE_TOKEN_RE.finditer(value):
++            add(match.group(1), match.group(2))
++
++    for call in tool_calls:
++        walk(call.get("result"), None)
++    return records
++
++
++def _finish(flow: dict[str, Any], wall_start: float, output: str) -> int:
++    flow["wall_clock_ms"] = (time.monotonic() - wall_start) * 1000.0
+     directory = os.path.dirname(output)
+     if directory:
+         os.makedirs(directory, exist_ok=True)
+     with open(output, "w", encoding="utf-8") as handle:
+         json.dump(flow, handle, ensure_ascii=False, indent=2)
++    return 0
+ 
+ 
+ def _safe(value: Any) -> str:
+     if isinstance(value, dict):
+-        return json.dumps(value, ensure_ascii=False)[:500]
++        return json.dumps(value, ensure_ascii=False)[:600]
+     return str(value)
+ 
+ 
+diff --git a/src/slime_bridge/adapter.py b/src/slime_bridge/adapter.py
+index b3aad685..da0ae7ef 100644
+--- a/src/slime_bridge/adapter.py
++++ b/src/slime_bridge/adapter.py
+@@ -167,7 +167,7 @@ def _build_sample(
+         tokens=prompt_ids + response_ids,
+         response=response_text,
+         response_length=len(response_ids),
+-        group_id=index,
++        rollout_id=index,
+         reward={reward_key: reward_value},
+         loss_mask=loss_mask,
+         rollout_log_probs=response_log_probs,
+@@ -213,7 +213,7 @@ def _build_dummy_sample(
+         tokens=[0, 0],
+         response="",
+         response_length=1,
+-        group_id=index,
++        rollout_id=index,
+         reward={reward_key: 0.0},
+         loss_mask=[0],
+         rollout_log_probs=[0.0],
+diff --git a/src/slime_bridge/reward_post_process.py b/src/slime_bridge/reward_post_process.py
+index 3f4ed0b0..018f5553 100644
+--- a/src/slime_bridge/reward_post_process.py
++++ b/src/slime_bridge/reward_post_process.py
+@@ -59,7 +59,7 @@ def post_process_rewards(
+         elif _has_trainable_tokens(sample):
+             traj_valid_rewards[key].append(raw_rewards[i])
+ 
+-    normalized_by_sample = [0.0] * len(samples)
++    normalized_by_sample = [1e-8] * len(samples)
+     for keys in group_keys.values():
+         valid_keys = [
+             key for key in keys
+@@ -85,12 +85,13 @@ def post_process_rewards(
+                     raw_rewards[sample_index] - baseline
+                 ) / scale
+ 
++    normalized_by_sample = [r if abs(r) > 1e-10 else 1e-8 for r in normalized_by_sample]
+     return raw_rewards, normalized_by_sample
+ 
+ 
+ def _trajectory_key(sample: Any, sample_position: int) -> tuple[Any, tuple[Any, Any]]:
+     group_idx = _key_value(getattr(sample, "group_index", None), -1)
+-    traj_idx = getattr(sample, "group_id", None)
++    traj_idx = getattr(sample, "rollout_id", None)
+     if traj_idx is None:
+         traj_idx = getattr(sample, "index", None)
+     return group_idx, (group_idx, _key_value(traj_idx, sample_position))
+diff --git a/tests/xyne/test_e2e_xyne.py b/tests/xyne/test_e2e_xyne.py
+index 71f89970..5e5abb59 100644
+--- a/tests/xyne/test_e2e_xyne.py
++++ b/tests/xyne/test_e2e_xyne.py
+@@ -274,8 +274,9 @@ async def test_e2e_happy_path_chains_harness_builder_evaluator() -> None:
+     # The citation-accuracy scorer is positive because expected_doc_ids match
+     # the citation itemIds -> proves the config forwarding worked E2E.
+     assert per_scorer["citation_accuracy"] == pytest.approx(1.0)
+-    # llm_judge returns the canned mock float (no network ever touched).
+-    assert per_scorer["llm_judge"] == pytest.approx(0.8)
++    # llm_judge returns the canned mock float (0.8), quantized to the discrete
++    # 1.0 (no network ever touched).
++    assert per_scorer["llm_judge"] == pytest.approx(1.0)
+ 
+     # Plan assertion (4): outcome_reward is a meaningful composite in [0,1].
+     reward = eval_result.outcome_reward
+diff --git a/tests/xyne/test_evaluator.py b/tests/xyne/test_evaluator.py
+index 2c36fed6..a250b624 100644
+--- a/tests/xyne/test_evaluator.py
++++ b/tests/xyne/test_evaluator.py
+@@ -9,6 +9,10 @@ so no real network is ever touched.
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import json
++import time
++
+ import httpx
+ import pytest
+ 
+@@ -51,6 +55,30 @@ def _trajectory(*, metadata: dict | None = None) -> Trajectory:
+     return Trajectory(status="COMPLETED", metadata=metadata or {})
+ 
+ 
++@pytest.mark.asyncio
++async def test_evaluate_offloads_single_scorer_pass(monkeypatch: pytest.MonkeyPatch) -> None:
++    calls = 0
++
++    class SlowPipeline:
++        def run_with_scores(self, flow: XyneRawFlow) -> tuple[float, dict[str, float]]:
++            nonlocal calls
++            calls += 1
++            time.sleep(0.05)
++            return 0.75, {"slow": 0.75}
++
++    monkeypatch.setattr("polar.xyne.evaluator._build_pipeline", lambda config: SlowPipeline())
++    task = asyncio.create_task(
++        XyneCompositeEvaluator().evaluate(
++            _trajectory(metadata={"xyne_raw": _flow().to_dict()})
++        )
++    )
++    await asyncio.sleep(0.01)
++    assert not task.done()
++    result = await task
++    assert calls == 1
++    assert result.outcome_reward == pytest.approx(0.75)
++
++
+ # --------------------------------------------------------------------------- #
+ # Plan acceptance case 1: missing metadata -> 0.0, no crash
+ # --------------------------------------------------------------------------- #
+@@ -249,7 +277,53 @@ async def test_judge_config_reaches_llm_judge_via_mock_transport() -> None:
+     result = await XyneCompositeEvaluator(**config).evaluate(
+         _trajectory(metadata={"xyne_raw": flow.to_dict()})
+     )
+-    assert result.metadata["per_scorer"]["llm_judge"] == pytest.approx(0.7)
++    assert result.metadata["per_scorer"]["llm_judge"] == pytest.approx(0.5)
++
++
++@pytest.mark.asyncio
++async def test_judge_dimension_config_reaches_llm_judge() -> None:
++    # Multi-dimensional judge config (dimension_weights, max_concurrency and an
++    # enable_<dim> toggle) must reach the constructed LLMJudgeScorer. The mock
++    # handler scores correctness 1.0 and every other enabled dimension 0.0, so
++    # with correctness weighted 3.0 and quality+groundedness disabled the
++    # composite proves both the weight (0.75) and the enable toggles were
++    # forwarded (unweighted would be 0.5).
++    seen_dims: list[str] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        body = json.loads(request.content)
++        content = body["messages"][1]["content"]
++        for dim in ("quality", "correctness", "groundedness", "citation_accuracy"):
++            if f"rubric ({dim})" in content:
++                seen_dims.append(dim)
++        value = "1.0" if "rubric (correctness)" in content else "0.0"
++        return httpx.Response(200, json={"choices": [{"message": {"content": value}}]})
++
++    transport = httpx.MockTransport(handler)
++    flow = _flow(answer="a judged answer")
++    config = {
++        "scorers": _ALL_8,
++        "judge": {
++            "base_url": "http://judge.local/v1",
++            "model": "gpt-4o-mini",
++            "dimension_weights": {"correctness": 3.0},
++            "max_concurrency": 2,
++            "enable_quality": False,
++            "enable_groundedness": False,
++        },
++    }
++    # Inline _transport on the llm_judge entry (no real network).
++    config["scorers"] = [
++        entry if entry["name"] != "llm_judge" else {**entry, "_transport": transport}
++        for entry in _ALL_8
++    ]
++    result = await XyneCompositeEvaluator(**config).evaluate(
++        _trajectory(metadata={"xyne_raw": flow.to_dict()})
++    )
++    # quality+groundedness disabled -> correctness+citation_accuracy remain.
++    assert set(seen_dims) == {"correctness", "citation_accuracy"}
++    # correctness=1.0 (weight 3.0), citation_accuracy=0.0 -> 3/4.
++    assert result.metadata["per_scorer"]["llm_judge"] == pytest.approx(0.75)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/xyne/test_harness.py b/tests/xyne/test_harness.py
+index 6da4372b..f27efa31 100644
+--- a/tests/xyne/test_harness.py
++++ b/tests/xyne/test_harness.py
+@@ -451,3 +451,76 @@ def test_resolve_session_id_explicit_header_routes_to_own_session() -> None:
+         )
+         == "SID_B"
+     )
++
++
++def test_synth_sse_forwards_tool_calls_deltas() -> None:
++    """Regression: stream→nonstream→synth must not drop message.tool_calls.
++
++    Without delta.tool_calls, pi-ai sets stopReason=toolUse but never builds
++    toolCall blocks → Vespa never runs → /dump.toolCalls stays empty.
++    """
++    import json
++
++    from polar.xyne.session_proxy import synth_sse
++
++    body = json.dumps(
++        {
++            "id": "chatcmpl-test",
++            "created": 1,
++            "model": "open-fast",
++            "choices": [
++                {
++                    "index": 0,
++                    "finish_reason": "tool_calls",
++                    "message": {
++                        "role": "assistant",
++                        "content": "I'll search…",
++                        "reasoning_content": "plan",
++                        "tool_calls": [
++                            {
++                                "id": "chatcmpl-tool-a",
++                                "type": "function",
++                                "function": {
++                                    "name": "vespaSearch",
++                                    "arguments": '{"query": "SEBI"}',
++                                },
++                            },
++                            {
++                                "id": "chatcmpl-tool-b",
++                                "type": "function",
++                                "function": {
++                                    "name": "vespaSearch",
++                                    "arguments": '{"query": "Spl Case"}',
++                                },
++                            },
++                        ],
++                    },
++                }
++            ],
++            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
++        }
++    ).encode()
++
++    sse = synth_sse(body)
++    assert sse is not None
++    text = sse.decode()
++    assert "vespaSearch" in text
++    assert "chatcmpl-tool-a" in text
++    assert "chatcmpl-tool-b" in text
++    assert '"finish_reason": "tool_calls"' in text or '"finish_reason":"tool_calls"' in text
++
++    events = []
++    for line in text.splitlines():
++        if line.startswith("data: ") and line[6:].strip() not in ("", "[DONE]"):
++            events.append(json.loads(line[6:]))
++    tool_deltas = [
++        tc
++        for ev in events
++        for choice in (ev.get("choices") or [])
++        for tc in ((choice.get("delta") or {}).get("tool_calls") or [])
++    ]
++    assert len(tool_deltas) == 2
++    assert tool_deltas[0]["index"] == 0
++    assert tool_deltas[0]["function"]["name"] == "vespaSearch"
++    assert tool_deltas[1]["index"] == 1
++    assert '"query": "Spl Case"' in tool_deltas[1]["function"]["arguments"]
+diff --git a/tests/xyne/test_scorers.py b/tests/xyne/test_scorers.py
+index 02edb2e9..ce8b02f0 100644
+--- a/tests/xyne/test_scorers.py
++++ b/tests/xyne/test_scorers.py
+@@ -10,14 +10,24 @@ from __future__ import annotations
+ import httpx
+ import pytest
+ 
+-from polar.xyne.reward_pipeline import build_pipeline
++import json
++import asyncio
++from pathlib import Path
++
++from polar.xyne.reward_pipeline import build_pipeline, SCORER_REGISTRY
+ from polar.xyne.scorers import ALL_SCORERS
+ from polar.xyne.scorers.answer_format import AnswerFormatScorer
+ from polar.xyne.scorers.citation_accuracy import CitationAccuracyScorer
+ from polar.xyne.scorers.citation_presence import CitationPresenceScorer
+ from polar.xyne.scorers.citation_relevance import CitationRelevanceScorer
+ from polar.xyne.scorers.completion import CompletionScorer
+-from polar.xyne.scorers.llm_judge import LLMJudgeScorer
++from polar.xyne.scorers.llm_judge import (
++    DEFAULT_MAX_TOKENS,
++    LLMJudgeScorer,
++    _extract_score,
++    _quantize,
++    _render_citations,
++)
+ from polar.xyne.scorers.retrieval_quality import RetrievalQualityScorer
+ from polar.xyne.scorers.subagent_success import SubagentSuccessScorer
+ from polar.xyne.types import XyneRawFlow
+@@ -30,6 +40,7 @@ def _flow(
+     citations: list[dict] | None = None,
+     nested_runs: list[dict] | None = None,
+     request_messages: list[dict] | None = None,
++    retrieved_chunks: list[dict] | None = None,
+ ) -> XyneRawFlow:
+     return XyneRawFlow(
+         conversation_id="conv-1",
+@@ -38,6 +49,7 @@ def _flow(
+         answer=answer,
+         citations=citations or [],
+         nested_runs=nested_runs or [],
++        retrieved_chunks=retrieved_chunks or [],
+         error=error,
+     )
+ 
+@@ -69,6 +81,9 @@ def test_all_scorers_registered() -> None:
+         "citation_accuracy",
+         "retrieval_quality",
+         "subagent_success",
++        "embedding_similarity",
++        "tool_call_efficiency",
++        "token_efficiency",
+         "llm_judge",
+     }
+ 
+@@ -209,9 +224,11 @@ def test_retrieval_quality_all_ok_and_relevant_is_one() -> None:
+     assert RetrievalQualityScorer().score(flow) == pytest.approx(1.0)
+ 
+ 
+-def test_retrieval_quality_empty_nested_and_no_citations_is_zero() -> None:
++def test_retrieval_quality_empty_scores_half_vacuous() -> None:
++    # Empty sub_agents/nested_runs -> sub_agent_success is vacuously 1.0;
++    # no citations -> relevance 0.0. 0.5*1.0 + 0.5*0.0 = 0.5.
+     flow = _flow(nested_runs=[], citations=[])
+-    assert RetrievalQualityScorer().score(flow) == pytest.approx(0.0)
++    assert RetrievalQualityScorer().score(flow) == pytest.approx(0.5)
+ 
+ 
+ def test_retrieval_quality_partial_subagent_failure_combines() -> None:
+@@ -265,7 +282,7 @@ def test_llm_judge_returns_judge_score() -> None:
+     scorer = LLMJudgeScorer(
+         config={"judge_base_url": "http://judge.local/v1", "_transport": transport}
+     )
+-    assert scorer.score(_flow(answer="an answer")) == pytest.approx(0.7)
++    assert scorer.score(_flow(answer="an answer")) == pytest.approx(0.5)
+ 
+ 
+ def test_llm_judge_http_500_returns_zero() -> None:
+@@ -305,7 +322,7 @@ def test_llm_judge_network_failure_returns_zero() -> None:
+ # --------------------------------------------------------------------------- #
+ 
+ 
+-def test_build_pipeline_runs_all_eight_scorers() -> None:
++def test_build_pipeline_runs_all_scorers() -> None:
+     config = {
+         "scorers": [
+             {"name": "completion"},
+@@ -315,6 +332,9 @@ def test_build_pipeline_runs_all_eight_scorers() -> None:
+             {"name": "citation_accuracy", "weight": 0.0},
+             {"name": "retrieval_quality"},
+             {"name": "subagent_success"},
++            {"name": "embedding_similarity", "reference_answer": "a solid answer"},
++            {"name": "tool_call_efficiency"},
++            {"name": "token_efficiency"},
+             {"name": "llm_judge"},
+         ]
+     }
+@@ -331,3 +351,437 @@ def test_build_pipeline_runs_all_eight_scorers() -> None:
+     assert set(per_scorer) == set(ALL_SCORERS)
+     # llm_judge with no base_url must not hit the network -> 0.0.
+     assert per_scorer["llm_judge"] == 0.0
++
++
++# --------------------------------------------------------------------------- #
++# Multi-dim LLMJudgeScorer: composite / concurrency / disable / registry /
++# prompt rendering (httpx MockTransport — no real network)
++# --------------------------------------------------------------------------- #
++
++DIM_VALUES = {"quality": 0.9, "correctness": 0.8, "groundedness": 0.7, "citation_accuracy": 0.6}
++
++
++def _dim_from_request(request: httpx.Request) -> str:
++    """Extract the dimension being scored from a judge request body's user content.
++
++    The rendered user content contains ``Dimension rubric (<dim>):`` — parse it so
++    a handler can route per-dimension responses deterministically.
++    """
++    body = json.loads(request.content)
++    user = body["messages"][1]["content"]
++    marker = "Dimension rubric ("
++    start = user.index(marker) + len(marker)
++    end = user.index("):", start)
++    return user[start:end]
++
++
++def _per_dimension_handler(values: dict[str, float]):
++    """Return a MockTransport handler that answers each dimension with its float."""
++    def handler(request: httpx.Request) -> httpx.Response:
++        dim = _dim_from_request(request)
++        content = str(values.get(dim, 0.0))
++        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
++
++    return handler
++
++
++def _referenced_flow() -> XyneRawFlow:
++    """A flow carrying a reference_answer in metadata plus Q/A/citations."""
++    flow = _flow(
++        answer="Paris is the capital of France.",
++        citations=[{"snippet": "Paris, the capital of France, sits on the Seine."}],
++        request_messages=[{"role": "user", "content": "What is the capital of France?"}],
++    )
++    flow.metadata["reference_answer"] = "Paris is the capital of France."
++    return flow
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_multi_dim_composite_correct() -> None:
++    transport = httpx.MockTransport(_per_dimension_handler(DIM_VALUES))
++    scorer = LLMJudgeScorer(
++        config={"judge_base_url": "http://judge.local/v1", "_transport": transport}
++    )
++    score = await scorer.score_async(_referenced_flow())
++    # All four dims enabled, weight 1.0 each: (0.9+0.8+0.7+0.6)/4 = 0.75
++    assert score == pytest.approx(0.75)
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_dimension_weights_shift_composite() -> None:
++    transport = httpx.MockTransport(_per_dimension_handler(DIM_VALUES))
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": transport,
++            "dimension_weights": {"quality": 2.0},
++        }
++    )
++    score = await scorer.score_async(_referenced_flow())
++    # dims quantize to {1.0, 1.0, 0.5, 0.5}; weights: quality=2, others=1
++    # -> (2*1.0 + 1.0 + 0.5 + 0.5)/(2+1+1+1) = 4.0/5 = 0.8
++    assert score == pytest.approx(0.8)
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_sync_score_bridge_matches_async_composite() -> None:
++    transport = httpx.MockTransport(_per_dimension_handler(DIM_VALUES))
++    scorer = LLMJudgeScorer(
++        config={"judge_base_url": "http://judge.local/v1", "_transport": transport}
++    )
++    flow = _referenced_flow()
++    await_score = await scorer.score_async(flow)
++    sync_score = scorer.score(flow)  # sync bridge (called outside a running loop)
++    assert sync_score == pytest.approx(0.75)
++    assert sync_score == pytest.approx(await_score)
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_scorer_reuse_across_sync_bridge_no_deadlock() -> None:
++    """Locked regression: reuse ONE scorer across sync-bridge calls from inside a running loop.
++
++    Each `score()` runs its async dimension calls on a fresh loop in a worker
++    thread (a live loop is running here). With max_concurrency=2 the four
++    dimension POSTs contend, so the semaphore binds to a loop. Reusing the same
++    instance across two calls must NOT raise a cross-loop RuntimeError or an
++    IndexError, and must return the correct composite both times.
++    """
++    transport = httpx.MockTransport(_per_dimension_handler(DIM_VALUES))
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": transport,
++            "max_concurrency": 2,
++        }
++    )
++    flow = _referenced_flow()
++    first = scorer.score(flow)
++    second = scorer.score(flow)
++    assert first == pytest.approx(0.75)
++    assert second == pytest.approx(0.75)
++
++
++def _make_tracking_transport(peak: list[int], current: list[int]) -> httpx.MockTransport:
++    async def handler(request: httpx.Request) -> httpx.Response:
++        current[0] += 1
++        peak[0] = max(peak[0], current[0])
++        try:
++            await asyncio.sleep(0.01)
++            return httpx.Response(
++                200, json={"choices": [{"message": {"content": "1.0"}}]}
++            )
++        finally:
++            current[0] -= 1
++
++    return httpx.MockTransport(handler)
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_concurrency_respects_max_concurrency() -> None:
++    peak: list[int] = [0]
++    current: list[int] = [0]
++    transport = _make_tracking_transport(peak, current)
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": transport,
++            "max_concurrency": 2,
++        }
++    )
++    await scorer.score_async(_referenced_flow())
++    assert peak[0] <= 2
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_default_concurrency_cap_is_twenty() -> None:
++    peak: list[int] = [0]
++    current: list[int] = [0]
++    transport = _make_tracking_transport(peak, current)
++    scorer = LLMJudgeScorer(
++        config={"judge_base_url": "http://judge.local/v1", "_transport": transport}
++    )
++    await scorer.score_async(_referenced_flow())
++    # The semaphore must be loose enough to run all four dimensions concurrently
++    # (default cap 20), so peak reaches 4 — never clamped by a smaller default.
++    assert peak[0] == 4
++    assert scorer._max_concurrency == 20
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_disabled_dimension_excluded_from_composite() -> None:
++    # Disable correctness -> only quality/groundedness/citation_accuracy count.
++    transport = httpx.MockTransport(_per_dimension_handler(DIM_VALUES))
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": transport,
++            "enable_correctness": False,
++        }
++    )
++    score = await scorer.score_async(_referenced_flow())
++    # dims quantize to {1.0, 0.5, 0.5} (correctness disabled) -> 2.0/3
++    assert score == pytest.approx((1.0 + 0.5 + 0.5) / 3)  # 0.6666...
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_all_disabled_returns_zero_without_requests() -> None:
++    calls: list[str] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        calls.append("boom")
++        return httpx.Response(200, json={"choices": [{"message": {"content": 1.0}}]})
++
++    transport = httpx.MockTransport(handler)
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": transport,
++            "enable_quality": False,
++            "enable_correctness": False,
++            "enable_groundedness": False,
++            "enable_citation_accuracy": False,
++        }
++    )
++    assert await scorer.score_async(_referenced_flow()) == 0.0
++    assert calls == []  # no request was made
++
++
++# --------------------------------------------------------------------------- #
++# Registry round-trip for the new config keys
++# --------------------------------------------------------------------------- #
++
++
++def test_llm_judge_registered_under_llm_judge_and_all_scorers() -> None:
++    assert "llm_judge" in SCORER_REGISTRY
++    assert SCORER_REGISTRY["llm_judge"] is LLMJudgeScorer
++    assert ALL_SCORERS["llm_judge"] is LLMJudgeScorer
++
++
++def test_llm_judge_constructible_with_all_new_config_keys() -> None:
++    transport = httpx.MockTransport(_per_dimension_handler(DIM_VALUES))
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "judge_api_key": "sk-test",
++            "judge_model": "judge-model-x",
++            "prompt_template": "Q:{question} A:{answer} Ref:{reference}",
++            "timeout": 5.0,
++            "_transport": transport,
++            "max_concurrency": 3,
++            "dimension_weights": {"quality": 2.0, "correctness": 0.5},
++            "enable_quality": True,
++            "enable_correctness": True,
++            "enable_groundedness": True,
++            "enable_citation_accuracy": True,
++        }
++    )
++    assert scorer.name == "llm_judge"
++    assert scorer._model == "judge-model-x"
++    assert scorer._max_concurrency == 3
++    assert scorer._dimension_weights["quality"] == 2.0
++    assert scorer._enabled_dims["quality"] is True
++
++
++# --------------------------------------------------------------------------- #
++# Prompt rendering (deterministic request-body assertion)
++# --------------------------------------------------------------------------- #
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_renders_qa_citations_reference_and_rubric() -> None:
++    captured: list[dict] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        captured.append(json.loads(request.content))
++        return httpx.Response(200, json={"choices": [{"message": {"content": 0.5}}]})
++
++    transport = httpx.MockTransport(handler)
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": transport,
++            "judge_model": "judge-model-x",
++        }
++    )
++    flow = _referenced_flow()
++    await scorer.score_async(flow)
++
++    assert len(captured) == 4  # one request per enabled dimension
++    body = captured[0]
++    assert body["model"] == "judge-model-x"
++    assert body["temperature"] == 0.0
++    assert body["messages"][0]["role"] == "system"
++    user = body["messages"][1]["content"]
++
++    # Question, answer, and cited snippet all appear in the rendered content.
++    assert "What is the capital of France?" in user
++    assert "Paris is the capital of France." in user
++    assert "1. Paris, the capital of France, sits on the Seine." in user
++    # Reference/ground-truth answer path is exercised.
++    assert "Reference (ground truth) answer: Paris is the capital of France." in user
++    # The dimension rubric is inlined.
++    assert "Quality: judge the overall quality of the answer" in user
++
++    # Every one of the four dimensions is asked, each with its own rubric.
++    all_user = "\n".join(b["messages"][1]["content"] for b in captured)
++    for dim in DIM_VALUES:
++        assert f"Dimension rubric ({dim}):" in all_user
++
++
++# --------------------------------------------------------------------------- #
++# Citation rendering / score extraction / request body (regression fixes)
++# --------------------------------------------------------------------------- #
++
++
++def test_llm_judge_render_citations_uses_chunk_key() -> None:
++    """Real/live data store the snippet text under ``chunk``, not ``snippet``."""
++    rendered = _render_citations([{"chunk": "Paris sits on the Seine."}])
++    assert "1. Paris sits on the Seine." in rendered
++    assert "(none)" not in rendered
++
++
++def test_llm_judge_render_citations_falls_back_gracefully_no_text_keys() -> None:
++    # A citation with no recognized text key renders as an empty numbered line,
++    # never crashes, and does not fabricate "(none)" while other lines exist.
++    rendered = _render_citations([{"docId": "doc-1"}, {"chunk": "real chunk"}])
++    assert "2. real chunk" in rendered
++    assert "(none)" not in rendered
++
++
++def test_llm_judge_render_citations_resolves_tool_evidence() -> None:
++    flow = _flow(
++        citations=[{"docId": "doc-1", "chunk": 7}],
++        retrieved_chunks=[
++            {
++                "docId": "doc-1",
++                "chunk": 7,
++                "source_text": "The cited source says leave is capped at ten days.",
++            }
++        ],
++    )
++    rendered = _render_citations(flow.citations, flow=flow)
++    assert "[doc-1#7]" in rendered
++    assert "leave is capped at ten days" in rendered
++
++
++def test_llm_judge_render_citations_keeps_identifier_without_text() -> None:
++    rendered = _render_citations([{"docId": "doc-1", "chunk": 7}])
++    assert rendered == "1. [doc-1#7]"
++
++
++def test_llm_judge_render_citations_empty_input_is_none() -> None:
++    assert _render_citations([]) == "(none)"
++
++
++def test_llm_judge_extract_score_prefers_trailing_labeled_number() -> None:
++    # A trailing "Score: 0.85" must win over an earlier stray decimal.
++    text = "The answer is solid overall, maybe 0.4. Score: 0.85"
++    # 0.85 quantizes to 1.0; had the stray 0.4 won, it would be 0.5.
++    assert _extract_score(text) == pytest.approx(1.0)
++
++
++def test_llm_judge_extract_score_last_label_wins() -> None:
++    text = "Score: 0.2 reconsidered ... Final Score: 0.9"
++    # 0.9 quantizes to 1.0; had the earlier 0.2 won, it would be 0.0.
++    assert _extract_score(text) == pytest.approx(1.0)
++
++
++def test_llm_judge_extract_score_unparseable_is_none() -> None:
++    assert _extract_score("not a number at all") is None
++
++
++def test_llm_judge_quantize_maps_to_discrete_scale() -> None:
++    assert _quantize(1.0) == 1.0
++    assert _quantize(0.0) == 0.0
++    assert _quantize(0.5) == 0.5
++    assert _quantize(0.75) == 1.0
++    assert _quantize(0.3) == 0.5
++    assert _quantize(0.25) == 0.0
++    assert _quantize(0.4) == 0.5
++    assert _quantize(1.3) == 1.0
++    assert _quantize(-0.2) == 0.0
++    assert _quantize(0.6) == 0.5
++
++
++def test_llm_judge_extract_score_quantizes_labeled_number() -> None:
++    # Any parsed float snaps to the nearest of {0.0, 0.5, 1.0}.
++    assert _extract_score("Score: 0.85") == pytest.approx(1.0)
++    assert _extract_score("Score: 0.3") == pytest.approx(0.5)
++
++
++def test_llm_judge_extract_score_quantizes_bare_number() -> None:
++    assert _extract_score("0.25") == pytest.approx(0.0)
++    assert _extract_score("0.6") == pytest.approx(0.5)
++    assert _extract_score("1.3") == pytest.approx(1.0)
++    assert _extract_score("-0.2") == pytest.approx(0.0)
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_matches_manual_labeled_examples_offline() -> None:
++    """Regression harness for the hand-labeled 0/0.5/1 judge calibration set."""
++    fixture = Path(__file__).parent / "fixtures" / "multidim_judge_labeled.json"
++    examples = json.loads(fixture.read_text(encoding="utf-8"))
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        body = json.loads(request.content)
++        user = body["messages"][1]["content"]
++        dimension = user[user.index("Dimension rubric (") + len("Dimension rubric ("):]
++        dimension = dimension[:dimension.index("):")]
++        for case in examples:
++            if case["answer"] in user:
++                return httpx.Response(
++                    200,
++                    json={"choices": [{"message": {"content": f"Score: {case['label'][dimension]}"}}]},
++                )
++        raise AssertionError("judge request did not contain a labeled example")
++
++    scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": httpx.MockTransport(handler),
++        }
++    )
++    for case in examples:
++        flow = _flow(
++            answer=case["answer"],
++            citations=[{"docId": "doc-1", "chunk": 7}],
++            retrieved_chunks=[{"docId": "doc-1", "chunk": 7, "source_text": case["citation"]}],
++            request_messages=[{"role": "user", "content": case["question"]}],
++        )
++        actual = await scorer.score_async(flow)
++        expected = sum(case["label"].values()) / 4.0
++        assert actual == pytest.approx(expected), case["id"]
++
++
++@pytest.mark.asyncio
++async def test_llm_judge_request_body_has_max_tokens_and_labeled_instruction() -> None:
++    captured: list[dict] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        captured.append(json.loads(request.content))
++        return httpx.Response(200, json={"choices": [{"message": {"content": 0.5}}]})
++
++    transport = httpx.MockTransport(handler)
++    scorer = LLMJudgeScorer(
++        config={"judge_base_url": "http://judge.local/v1", "_transport": transport}
++    )
++    await scorer.score_async(_referenced_flow())
++
++    body = captured[0]
++    assert body["max_tokens"] == DEFAULT_MAX_TOKENS
++
++    override_transport = httpx.MockTransport(handler)
++    override_scorer = LLMJudgeScorer(
++        config={
++            "judge_base_url": "http://judge.local/v1",
++            "_transport": override_transport,
++            "max_tokens": 1024,
++        }
++    )
++    await override_scorer.score_async(_referenced_flow())
++    assert captured[-1]["max_tokens"] == 1024
++
++    system = body["messages"][0]["content"]
++    user = body["messages"][1]["content"]
++    assert "Score: <0.0, 0.5, or 1.0>" in system
++    assert "Score: <0.0, 0.5, or 1.0>" in user

@@ -1,0 +1,254 @@
+name: xyne-app-local-sim
+
+x-xyne-env: &xyne-env
+  NODE_ENV: production
+  DATABASE_HOST: xyne-db
+  DATABASE_PORT: "5432"
+  DATABASE_USER: ${DATABASE_USER:-xyne}
+  DATABASE_PASSWORD: ${DATABASE_PASSWORD:-xyne}
+  DATABASE_NAME: ${DATABASE_NAME:-xyne}
+  DATABASE_URL: ${DATABASE_URL:-postgresql://xyne:xyne@xyne-db:5432/xyne}
+  VESPA_HOST: vespa
+  VESPA_FEED_PORT: "8080"
+  VESPA_QUERY_PORT: "8081"
+  REDIS_URL: redis://xyne-redis:6379/0
+  HOST: ${XYNE_PUBLIC_HOST:-http://100.111.195.29:3000}
+  SYNC_SERVER_HOST: xyne-app-sync
+  SYNC_SERVER_PORT: "3010"
+  # Current xyne-k8s-test source of truth points app/app-sync traffic at the
+  # GCP internal Docling LB. For pure local mock mode override this with:
+  # DOCLING_SERVICE_URL=http://xyne-docling-server-lb:8000
+  DOCLING_SERVICE_URL: ${DOCLING_SERVICE_URL:-http://10.2.0.83}
+  STATUS_ENDPOINT: ${STATUS_ENDPOINT:-}
+  DOCLING_TIMEOUT_MS: "900000"
+  DOCLING_STREAMING_MIN_PAGES: "101"
+  DOCLING_MAX_RETRIES: "1"
+  DOCLING_RETRY_DELAY_MS: "1000"
+  DOCLING_ASYNC_SUBMIT_PERMITS_ENABLED: "true"
+  DOCLING_ASYNC_SUBMIT_PERMITS: "240"
+  DOCLING_ACTIVE_FILE_LIMIT: "160"
+  DOCLING_ASYNC_SUBMIT_PERMIT_POLL_MS: "10000"
+  DOCLING_ASYNC_PART_SUBMIT_CONCURRENCY: "1"
+  DOCLING_ASYNC_SUBMIT_RETRIES: "30"
+  DOCLING_ASYNC_SUBMIT_RETRY_DELAY_MS: "2000"
+  DOCLING_RUNTIME_CONFIG_KEY: docling:runtime-config
+  DOCLING_RUNTIME_CONFIG_POLL_MS: "30000"
+  DOCLING_RESULTS_STREAM: docling:results
+  DOCLING_RESULT_GROUP: app-sync
+  DOCLING_PAGE_CHUNK_SIZE: "200"
+  DOCLING_RESULT_READ_COUNT: "1"
+  DOCLING_RESULT_BLOCK_MS: "1000"
+  DOCLING_RESULT_MIN_IDLE_MS: "60000"
+  FILE_PROCESSING_WORKER_THREADS: "1"
+  FILE_PROCESSING_TEAM_SIZE: "1"
+  QPDF_TIMEOUT_MS: "300000"
+  PDF_PROCESSING_DISABLE_FALLBACKS: "true"
+  PGBOSS_POOL_MAX: "20"
+  KB_STORAGE_ROOT: /usr/src/app/server/storage/kb_files
+  DOCLING_ASYNC_STORAGE_ROOT: /usr/src/app/server/storage/doclingAsync
+  DOCLING_TEMP_RESULTS_DIR: /usr/src/app/server/storage/tempDoclingResults
+  IMAGE_DIR: /usr/src/app/server/downloads/xyne_images_db
+  XYNE_CONTAINER_SERVER_ROOT: /usr/src/app/server
+  XYNE_HOST_SERVER_ROOT: /usr/src/app/server
+
+x-xyne-env-file: &xyne-env-file
+  - path: ${XYNE_SERVER_ENV_FILE:-./app-sim.env}
+    required: false
+
+x-xyne-volumes: &xyne-volumes
+  - ${XYNE_APP_DATA_DIR:-/opt/monitoring/app-data}/storage:/usr/src/app/server/storage
+  - ${XYNE_APP_DATA_DIR:-/opt/monitoring/app-data}/uploads:/usr/src/app/server/uploads
+  - ${XYNE_APP_DATA_DIR:-/opt/monitoring/app-data}/downloads:/usr/src/app/server/downloads
+  - ${XYNE_APP_DATA_DIR:-/opt/monitoring/app-data}/logs:/usr/src/app/server/logs
+
+services:
+  app:
+    image: ${XYNE_APP_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: xyne-app
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: ${XYNE_APP_COMMAND:-bun server.ts}
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      PORT: "3000"
+      METRICS_PORT: "3001"
+      DOCLING_PAGE_CHUNK_SIZE: "100"
+      PGBOSS_APPLICATION_NAME: xyne-app
+    volumes: *xyne-volumes
+    ports:
+      - "${XYNE_APP_PORT:-3000}:3000"
+      - "${XYNE_APP_METRICS_PORT:-3003}:3001"
+    networks:
+      - xyne_app
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:3000${XYNE_APP_HEALTH_PATH:-/health/live} >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  app-sync:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: xyne-app-sync
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun sync-server.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      PGBOSS_APPLICATION_NAME: xyne-app-sync
+    volumes: *xyne-volumes
+    ports:
+      - "${XYNE_APP_SYNC_PORT:-3010}:3010"
+    networks:
+      - xyne_app
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3010/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  docling-scheduler-splitter:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-splitter
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: splitter
+      PGBOSS_APPLICATION_NAME: docling-scheduler-splitter
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-submitter:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-submitter
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: submitter
+      PGBOSS_APPLICATION_NAME: docling-scheduler-submitter
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-result:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-result
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: result
+      DOCLING_RESULT_CONCURRENCY: "1"
+      PGBOSS_APPLICATION_NAME: docling-scheduler-result
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-result-2:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-result-2
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: result
+      DOCLING_RESULT_CONCURRENCY: "1"
+      PGBOSS_APPLICATION_NAME: docling-scheduler-result-2
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-result-3:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-result-3
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: result
+      DOCLING_RESULT_CONCURRENCY: "1"
+      PGBOSS_APPLICATION_NAME: docling-scheduler-result-3
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-result-4:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-result-4
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: result
+      DOCLING_RESULT_CONCURRENCY: "1"
+      PGBOSS_APPLICATION_NAME: docling-scheduler-result-4
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-writer:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-writer
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: writer
+      PGBOSS_APPLICATION_NAME: docling-scheduler-writer
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+  docling-scheduler-reaper:
+    image: ${XYNE_INGESTION_IMAGE:-xyne-ingestion:observability-sim}
+    container_name: docling-scheduler-reaper
+    user: ${XYNE_APP_USER:-root}
+    restart: unless-stopped
+    working_dir: /usr/src/app/server
+    command: bun doclingSchedulerWorker.ts
+    env_file: *xyne-env-file
+    environment:
+      <<: *xyne-env
+      DOCLING_SCHEDULER_ROLE: reaper
+      PGBOSS_APPLICATION_NAME: docling-scheduler-reaper
+    volumes: *xyne-volumes
+    networks:
+      - xyne_app
+
+networks:
+  xyne_app:
+    external: true
+    name: ${XYNE_DOCKER_NETWORK:-deployment_xyne}

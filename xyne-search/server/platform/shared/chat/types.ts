@@ -1,0 +1,190 @@
+import config from "@/config"
+import { messageFeedbackEnum } from "@/platform/db/schema"
+import { Apps } from "@xyne/vespa-ts/types"
+import type { Span } from "@/tracer"
+import { z } from "zod"
+import { entitySchema } from "@/platform/shared/types"
+import type { ConverseResponse } from "@/platform/ai/types"
+
+const { defaultBestModel, defaultFastModel } = config
+
+export const RagPipelineStages = {
+  QueryRouter: "QueryRouter",
+  NewChatTitle: "NewChatTitle",
+  AnswerOrSearch: "AnswerOrSearch",
+  AnswerWithList: "AnswerWithList",
+  AnswerOrRewrite: "AnswerOrRewrite",
+  RewriteAndAnswer: "RewriteAndAnswer",
+  UserChat: "UserChat",
+  DefaultRetrieval: "DefaultRetrieval",
+} as const
+export type RagPipelineStages =
+  (typeof RagPipelineStages)[keyof typeof RagPipelineStages]
+
+export const ragPipelineConfig = {
+  [RagPipelineStages.QueryRouter]: {
+    modelId: defaultFastModel,
+  },
+  [RagPipelineStages.AnswerOrSearch]: {
+    modelId: defaultBestModel,
+  },
+  [RagPipelineStages.AnswerWithList]: {
+    modelId: defaultBestModel,
+  },
+  [RagPipelineStages.NewChatTitle]: {
+    modelId: defaultFastModel,
+  },
+  [RagPipelineStages.AnswerOrRewrite]: {
+    modelId: defaultBestModel,
+  },
+  [RagPipelineStages.RewriteAndAnswer]: {
+    modelId: defaultBestModel,
+  },
+  [RagPipelineStages.UserChat]: {
+    modelId: defaultBestModel,
+  },
+  [RagPipelineStages.DefaultRetrieval]: {
+    modelId: defaultBestModel,
+    page: 5,
+  },
+}
+
+export const MinimalCitationSchema = z.object({
+  docId: z.string(),
+  title: z.string().optional(),
+  url: z.string().optional(),
+  app: z.nativeEnum(Apps),
+  entity: entitySchema,
+  threadId: z.string().optional(),
+  page_title: z.string().optional(),
+  itemId: z.string().optional(),
+  clId: z.string().optional(),
+  parentThreadId: z.string().optional(),
+  // Zoho Desk ticket timestamps
+  createdAt: z.string().optional(), // ISO timestamp for ticket creation
+  resolvedAt: z.string().optional(), // ISO timestamp for ticket resolution
+  closedAt: z.string().optional(), // ISO timestamp for ticket closure
+  status: z.string().optional(), // Ticket status (Open, Closed, etc.)
+  ticketNumber: z.string().optional(), // Ticket number
+  chunkIndices: z.array(z.number()).optional(),
+  returnedChunkIndices: z.array(z.number()).optional(),
+})
+
+export type Citation = z.infer<typeof MinimalCitationSchema>
+
+export interface ImageCitation {
+  citationKey: string
+  imagePath: string
+  imageData: string
+  item: Citation
+  mimeType?: string
+}
+
+export type ConverseResponseWithCitations = ConverseResponse & {
+  citation?: { index: string; item: any }
+  imageCitation?: ImageCitation
+}
+
+export interface MinimalAgentFragment {
+  id: string // Unique ID for the fragment
+  content: string
+  source: Citation
+  confidence: number
+  visibleChunkIndices: number[]
+  imageFileNames?: string[]
+}
+
+export const messageFeedbackSchema = z.object({
+  messageId: z.string(),
+  feedback: z.enum(messageFeedbackEnum.enumValues).nullable(), // Allows 'like', 'dislike', or null
+})
+
+// Enhanced feedback schema for new feedback system
+export const enhancedMessageFeedbackSchema = z.object({
+  messageId: z.string(),
+  type: z.enum(["like", "dislike"]),
+  customFeedback: z.string().optional(),
+  selectedOptions: z.array(z.string()).optional(),
+  shareChat: z.boolean().optional(), // New field for share chat option
+})
+
+export interface AgentTool {
+  name: string
+  description: string
+  parameters: Record<
+    string,
+    {
+      type: string
+      description: string
+      required: boolean
+    }
+  >
+  execute: (
+    params: any,
+    span?: Span,
+    email?: string,
+    userCtx?: string,
+    agentPrompt?: string,
+    userMessage?: string,
+  ) => Promise<{
+    result: string // Human-readable summary of action/result
+    contexts?: MinimalAgentFragment[] // Data fragments found
+    error?: string // Error message if failed
+    fallbackReasoning?: string // Detailed reasoning about why search failed
+  }>
+}
+export interface MetadataRetrievalParams {
+  from?: string
+  to?: string
+  app: string
+  entity?: string
+  filter_query?: string
+  limit?: number
+  offset?: number
+  order_direction?: "asc" | "desc"
+  excludedIds?: string[]
+  intent?: {
+    from?: string[]
+    to?: string[]
+    cc?: string[]
+    bcc?: string[]
+  }
+}
+
+export interface SearchParams {
+  query: string
+  limit?: number
+  sortBy?: "asc" | "desc"
+  offset?: number
+  excludedIds?: string[]
+  timeRange?: {
+    startTime?: string
+    endTime?: string
+  }
+}
+
+export interface ConversationalParams {
+  // No parameters
+}
+
+export interface SlackThreadsParams {
+  filter_query?: string
+  limit?: number
+  offset?: number
+  order_direction?: string
+}
+
+export interface SlackRelatedMessagesParams {
+  channel_name: string
+  filter_query?: string
+  user_email?: string
+  limit?: number
+  offset?: number
+  order_direction?: string
+  from?: string
+  to?: string
+}
+
+export interface SlackUserProfileParams {
+  user_email: string
+}

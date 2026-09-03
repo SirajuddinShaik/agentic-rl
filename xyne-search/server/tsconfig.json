@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"],
+      "search/types": ["./platform/search/types"],
+      // Workflow files must use the SDK's bundled zod (3.25), not our root zod 4
+      // /v3 shim — mismatched zod type identities blow up tsc (TS2589 -> 32GB).
+      "zodsdk": ["./node_modules/@xyne/workflow-sdk/node_modules/zod"]
+    },
+    // Enable latest features
+    "lib": ["ESNext", "DOM"],
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    // Bundler mode
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    // Best practices
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    // Strict flags (matched to app/). noPropertyAccessFromIndexSignature is
+    // intentionally omitted — it was 473 obj.x -> obj['x'] edits with ~no bug value.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "useUnknownInCatchVariables": true,
+    "erasableSyntaxOnly": true,
+    "noUncheckedSideEffectImports": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["."],
+  "exclude": ["node_modules", "build", "vespa-data", "storage", "downloads", "logs", "xyne-data"]
+}

@@ -1,0 +1,149 @@
+{
+  "conversation_id": "conv_71dee77a-693c-4298-b4d7-3edc9faf3da6",
+  "run_id": "run_46ef573b-22fd-411f-bde1-630083d8f3c7",
+  "request_messages": [
+    {
+      "role": "user",
+      "content": "In SEBI Spl Case No.259/14, what consequence did the court prescribe if the convicted directors failed to pay the fine of Rs.5,00,000 imposed on each of them?"
+    }
+  ],
+  "answer": "<|open|>tools<|sep|><|open|>call tool=\"vespaSearch\" index=\"1\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>SEBI Spl Case No.259/14 fine Rs.5,00,000 directors default imprisonment consequence<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>10<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"vespaSearch\" index=\"2\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>\"Spl. Case No. 259/14\" SEBI fine five lakh directors fail to pay<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>10<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+  "citations": [],
+  "debug_events": [],
+  "nested_runs": [],
+  "error": null,
+  "latency_ms": 213.67576999182347,
+  "wall_clock_ms": 32400.2912260039,
+  "metadata": {
+    "messages": [
+      {
+        "id": "msg_0d148711-95ca-46da-9489-5127aa92cdcb",
+        "conversationId": "conv_71dee77a-693c-4298-b4d7-3edc9faf3da6",
+        "turnId": "turn_fb4c277f-04ce-473c-980c-36d4a09745ac",
+        "role": "user",
+        "ordinal": 1,
+        "createdAt": 1786523966365,
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "In SEBI Spl Case No.259/14, what consequence did the court prescribe if the convicted directors failed to pay the fine of Rs.5,00,000 imposed on each of them?"
+          }
+        ]
+      },
+      {
+        "id": "msg_143f1c35-67f2-44c1-920c-e9a13c6ddd38",
+        "conversationId": "conv_71dee77a-693c-4298-b4d7-3edc9faf3da6",
+        "turnId": "turn_fb4c277f-04ce-473c-980c-36d4a09745ac",
+        "role": "assistant",
+        "ordinal": 2,
+        "createdAt": 1786523966403,
+        "runId": "run_46ef573b-22fd-411f-bde1-630083d8f3c7",
+        "stats": {
+          "durationMs": 30751,
+          "tokenUsage": {
+            "input": 3032,
+            "output": 258,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextUsage": {
+            "tokens": 3290,
+            "percent": 1.316,
+            "contextWindow": 250000
+          },
+          "cacheHitRatio": 0,
+          "retryAttempts": 0,
+          "compactionRounds": 0
+        },
+        "blocks": [
+          {
+            "kind": "thinking",
+            "text": "The user is asking about a specific case: SEBI Spl Case No.259/14, and what consequence the court prescribed if convicted directors failed to pay the fine of Rs.5,00,000 imposed on each.\n\nI need to search the knowledge base for this case. Let me use vespaSearch with a query about \"SEBI Spl Case No.259/14\" and also maybe filter. I don't know the exact field names, but I can use query.\n\nLet me start with a vespaSearch query."
+          },
+          {
+            "kind": "text",
+            "text": "<|open|>tools<|sep|><|open|>call tool=\"vespaSearch\" index=\"1\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>SEBI Spl Case No.259/14 fine Rs.5,00,000 directors default imprisonment consequence<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>10<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"vespaSearch\" index=\"2\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>\"Spl. Case No. 259/14\" SEBI fine five lakh directors fail to pay<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>10<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+          }
+        ]
+      }
+    ],
+    "assistant_message_id": "msg_143f1c35-67f2-44c1-920c-e9a13c6ddd38"
+  },
+  "tool_calls": [],
+  "tool_use_blocks": [],
+  "tool_result_blocks": [],
+  "sub_agents": [],
+  "thinking": [
+    "The user is asking about a specific case: SEBI Spl Case No.259/14, and what consequence the court prescribed if convicted directors failed to pay the fine of Rs.5,00,000 imposed on each.\n\nI need to search the knowledge base for this case. Let me use vespaSearch with a query about \"SEBI Spl Case No.259/14\" and also maybe filter. I don't know the exact field names, but I can use query.\n\nLet me start with a vespaSearch query."
+  ],
+  "messages": [
+    {
+      "id": "msg_0d148711-95ca-46da-9489-5127aa92cdcb",
+      "conversationId": "conv_71dee77a-693c-4298-b4d7-3edc9faf3da6",
+      "turnId": "turn_fb4c277f-04ce-473c-980c-36d4a09745ac",
+      "role": "user",
+      "ordinal": 1,
+      "createdAt": 1786523966365,
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "In SEBI Spl Case No.259/14, what consequence did the court prescribe if the convicted directors failed to pay the fine of Rs.5,00,000 imposed on each of them?"
+        }
+      ]
+    },
+    {
+      "id": "msg_143f1c35-67f2-44c1-920c-e9a13c6ddd38",
+      "conversationId": "conv_71dee77a-693c-4298-b4d7-3edc9faf3da6",
+      "turnId": "turn_fb4c277f-04ce-473c-980c-36d4a09745ac",
+      "role": "assistant",
+      "ordinal": 2,
+      "createdAt": 1786523966403,
+      "runId": "run_46ef573b-22fd-411f-bde1-630083d8f3c7",
+      "stats": {
+        "durationMs": 30751,
+        "tokenUsage": {
+          "input": 3032,
+          "output": 258,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextUsage": {
+          "tokens": 3290,
+          "percent": 1.316,
+          "contextWindow": 250000
+        },
+        "cacheHitRatio": 0,
+        "retryAttempts": 0,
+        "compactionRounds": 0
+      },
+      "blocks": [
+        {
+          "kind": "thinking",
+          "text": "The user is asking about a specific case: SEBI Spl Case No.259/14, and what consequence the court prescribed if convicted directors failed to pay the fine of Rs.5,00,000 imposed on each.\n\nI need to search the knowledge base for this case. Let me use vespaSearch with a query about \"SEBI Spl Case No.259/14\" and also maybe filter. I don't know the exact field names, but I can use query.\n\nLet me start with a vespaSearch query."
+        },
+        {
+          "kind": "text",
+          "text": "<|open|>tools<|sep|><|open|>call tool=\"vespaSearch\" index=\"1\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>SEBI Spl Case No.259/14 fine Rs.5,00,000 directors default imprisonment consequence<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>10<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"vespaSearch\" index=\"2\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>\"Spl. Case No. 259/14\" SEBI fine five lakh directors fail to pay<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>10<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        }
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "id": "run_46ef573b-22fd-411f-bde1-630083d8f3c7",
+      "conversationId": "conv_71dee77a-693c-4298-b4d7-3edc9faf3da6",
+      "turnId": "turn_fb4c277f-04ce-473c-980c-36d4a09745ac",
+      "agentId": "main",
+      "model": "claude-sonnet-4-6",
+      "status": "completed",
+      "startedAt": 1786523966395,
+      "endedAt": 1786523997238
+    }
+  ],
+  "token_usage": {
+    "input": 3032,
+    "output": 258,
+    "cacheRead": 0,
+    "cacheWrite": 0
+  }
+}
