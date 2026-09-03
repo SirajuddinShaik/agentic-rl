@@ -14,11 +14,13 @@ probe() {
   fi
 }
 
-probe "SGLang" "${SGLANG_BASE_URL:-http://127.0.0.1:30100}/v1/models"
-probe "XYNE" "${XYNE_BASE_URL:-http://127.0.0.1:3001}/v2/health"
-probe "Polar rollout" "${POLAR_ROLLOUT_URL:-http://127.0.0.1:8080}/health"
-probe "Polar gateway" "${POLAR_GATEWAY_URL:-http://127.0.0.1:8100}/health"
+probe "SGLang" "${SGLANG_BASE_URL:-http://192.168.111.7:30100}/v1/models"
+probe "XYNE" "${XYNE_BASE_URL:-http://127.0.0.1:3103}/v2/health"
+probe "Polar rollout" "${POLAR_ROLLOUT_URL:-http://127.0.0.1:8081}/health"
+probe "Polar gateway" "${POLAR_GATEWAY_URL:-http://127.0.0.1:8101}/health"
+probe "Session proxy" "${SESSION_PROXY_URL:-http://127.0.0.1:18114}/health"
 probe "Vespa query" "http://${VESPA_HOST:-127.0.0.1}:${VESPA_QUERY_PORT:-18081}/state/v1/health"
+probe "Vespa feed" "http://${VESPA_HOST:-127.0.0.1}:${VESPA_FEED_PORT:-18080}"
 
 if [[ -n "${RERANKER_PORT:-}" ]]; then
   probe "TEI reranker" "http://${RERANKER_HOST:-127.0.0.1}:${RERANKER_PORT}/info"

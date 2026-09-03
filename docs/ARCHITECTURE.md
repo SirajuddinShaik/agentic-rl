@@ -84,10 +84,11 @@
 | 1 | Postgres | `127.0.0.1:15432` | Xyne state and agent/tool config |
 | 2 | Vespa | query `:18081`, feed `:18080` | retrieval and chunk metadata |
 | 3 | SGLang | router `:30100` or engine `:30300` | policy inference |
-| 4 | Xyne backend | `:3001` or test lane `:3103` | agent loop and `/dump` |
-| 5 | Polar rollout | `:8081` | task/session orchestration |
-| 6 | Polar gateway | `:8101` | model proxy and attribution |
-| 7 | Miles trainer | Ray job | GRPO actor update |
+| 4 | Session proxy | `:18114` | Xyne LLM calls, session attribution, streaming/tool-call normalization |
+| 5 | Xyne backend | test lane `:3103` | agent loop and `/dump` |
+| 6 | Polar rollout | `:8081` | task/session orchestration |
+| 7 | Polar gateway | `:8101` | model proxy and attribution |
+| 8 | Miles trainer | Ray driver/job | GRPO actor update |
 
 ## Reward flow
 

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import base64
 import json
+import asyncio
 import shlex
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentRunResult
@@ -51,7 +53,9 @@ class XyneHarness(BaseHarness):
         settings = self.settings or {}
         self._api_key: str = settings.get("api_key") or self.env.get("XYNE_API_KEY") or ""
         self._base_url: str = str(settings.get("base_url", "http://localhost:3000")).rstrip("/")
-        self._agent_id: str = str(settings.get("agent_id", "") or self.env.get("XYNE_AGENT_ID", ""))
+        self._agent_id: str = str(
+            settings.get("agent_id", "") or self.env.get("XYNE_AGENT_ID", "")
+        )
         # The Xyne backend source is uploaded into the runtime by a PrepareAction
         # (not baked into the image). Make its mount point configurable.
         self._server_dir: str = str(settings.get("server_dir", "/workspace/xyne/server"))
@@ -101,11 +105,60 @@ class XyneHarness(BaseHarness):
         helper_file = Path(__file__).with_name("xyne_fetch_flow.py")
         return helper_file.read_text(encoding="utf-8")
 
+    def _render_proxy_source(self) -> str:
+        """Return the packaged multi-session LLM proxy source verbatim.
+
+        The proxy is a stdlib-only standalone module (``session_proxy.py``) that
+        must run with a bare ``python3`` inside the agent runtime container. It
+        is embedded into the run-step command (base64-inlined, then decoded and
+        started once on :18100). Embedding the file's source keeps the tested
+        ``resolve_session_id`` logic byte-for-byte the code that runs.
+        """
+        proxy_file = Path(__file__).with_name("session_proxy.py")
+        return proxy_file.read_text(encoding="utf-8")
+
     # ------------------------------------------------------------------
     # BaseHarness contract
     # ------------------------------------------------------------------
     def run_steps(self, instruction: str) -> list[ExecInput]:
         api_key_env = self._api_key
+        proxy_base_url = str(self.env.get("LITELLM_BASE_URL", "")).rstrip("/")
+        proxy_url = urlsplit(proxy_base_url) if proxy_base_url else None
+        if proxy_url is not None:
+            if proxy_url.scheme != "http" or proxy_url.hostname not in {
+                "127.0.0.1",
+                "localhost",
+                "::1",
+            }:
+                raise ValueError(
+                    "LITELLM_BASE_URL must point to the local Polar session proxy"
+                )
+            if proxy_url.path not in ("", "/"):
+                raise ValueError(
+                    "LITELLM_BASE_URL must be a base URL without /v1 or another path"
+                )
+            proxy_port = proxy_url.port or 80
+            proxy_host = "127.0.0.1"
+            proxy_upstream = str(
+                self.env.get(
+                    "POLAR_SESSION_PROXY_UPSTREAM", "http://127.0.0.1:8101"
+                )
+            ).rstrip("/")
+            routes_path = str(
+                self.env.get(
+                    "POLAR_SESSION_ROUTES_PATH",
+                    "/tmp/polar_session_routes.json",
+                )
+            )
+            routes_lock_path = str(
+                self.env.get(
+                    "POLAR_SESSION_ROUTES_LOCK_PATH",
+                    "/tmp/polar_session_routes.lock",
+                )
+            )
+            route_ttl_seconds = int(
+                self.env.get("POLAR_SESSION_ROUTE_TTL_SECONDS", "3600")
+            )
 
         # Quoted heredoc delimiter → XyneFetchEOF content is verbatim (the
         # helper uses ``$``/backticks that must not be expanded by bash).
@@ -147,74 +200,37 @@ class XyneHarness(BaseHarness):
         # fail to bind or attribute completions to the first session. Each run
         # registers its instruction; the proxy selects the matching session
         # from the outgoing chat-completions request body.
-        # This MUST run even when skip_boot=True (persistent backend), because
-        # the persistent backend was started with LITELLM_BASE_URL=:18100.
+        # This MUST run even when skip_boot=True (persistent backend). The
+        # proxy URL comes from the task environment, so the current :18114
+        # lane and isolated test lanes use the same packaged implementation.
         proxy_env = ["true"]
-        if self.env.get("LITELLM_BASE_URL"):
-            proxy_code = (
-                "from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer\n"
-                "import urllib.request,urllib.error,os,json,time,re\n"
-                "ROUTES='/tmp/polar_session_routes.json'\n"
-                "LOCK='/tmp/polar_session_routes.lock'\n"
-                "def routes():\n"
-                " try:\n"
-                "  with open(ROUTES)as f:r=json.load(f)\n"
-                "  return [x for x in r if x.get('expires',0)>time.time()]\n"
-                " except Exception:return []\n"
-                "def sid_for(body):\n"
-                " text=body.decode('utf-8','replace')\n"
-                " m=re.search(r'\\[polar-session:([^\\]\\r\\n]+)\\]',text)\n"
-                " if m:return m.group(1)\n"
-                " rr=sorted(routes(),key=lambda x:(len(x.get('instruction','')),x.get('created',0)),reverse=True)\n"
-                " for x in rr:\n"
-                "  if x.get('instruction') and x['instruction'] in text:return x['session_id']\n"
-                " return rr[-1]['session_id'] if len(rr)==1 else ''\n"
-                "class H(BaseHTTPRequestHandler):\n"
-                " def _p(self):\n"
-                "  n=int(self.headers.get('Content-Length')or 0)\n"
-                "  b=self.rfile.read(n)if n else None\n"
-                "  sid=sid_for(b or b'')\n"
-                "  public_models=self.command=='GET' and self.path.startswith('/v1/models')\n"
-                "  if not sid and not public_models:\n"
-                "   self.send_response(409);self.end_headers();self.wfile.write(b'no Polar session matched');return\n"
-                "  u='http://127.0.0.1:8100'+self.path\n"
-                "  r=urllib.request.Request(u,data=b,method=self.command)\n"
-                "  for k,v in self.headers.items():\n"
-                "   if k.lower() not in ('host','content-length','connection','authorization','x-api-key','x_session_id','proxy-x-session-id'):r.add_header(k,v)\n"
-                "  # Pin the matched rollout session so prefix_merging captures it.\n"
-                "  if sid:\n"
-                "   r.add_header('authorization','Bearer '+sid)\n"
-                "   r.add_header('x-session-id',sid)\n"
-                "  try:\n"
-                "   with urllib.request.urlopen(r,timeout=600)as resp:\n"
-                "    self.send_response(resp.status)\n"
-                "    for k,v in resp.headers.items():\n"
-                "     if k.lower() not in ('transfer-encoding','connection'):self.send_header(k,v)\n"
-                "    self.end_headers();self.wfile.write(resp.read())\n"
-                "  except urllib.error.HTTPError as e:\n"
-                "   self.send_response(e.code);self.end_headers();self.wfile.write(e.read())\n"
-                "  except Exception as e:\n"
-                "   self.send_response(502);self.end_headers();self.wfile.write(str(e).encode())\n"
-                " do_GET=_p;do_POST=_p;do_PUT=_p;do_DELETE=_p\n"
-                " def log_message(self,*a,**k):pass\n"
-                "ThreadingHTTPServer(('127.0.0.1',18100),H).serve_forever()"
-            )
+        if proxy_base_url:
+            proxy_code = self._render_proxy_source()
+
             b64 = base64.b64encode(proxy_code.encode()).decode()
+            proxy_runtime_path = f"/tmp/_sess_proxy_{proxy_port}.py"
             proxy_env.append(
                 # Initialize the one shared proxy once. The lock is held only
-                # during startup, never for the duration of an agent turn.
+                # during startup, never for the duration of an agent turn. An
+                # already-running persistent proxy is left untouched.
                 "(exec 8>/tmp/polar_proxy_init.lock; flock 8; "
-                "if ! curl -sf -o /dev/null -m 2 http://127.0.0.1:18100/v1/models; then "
-                f"echo {b64} | base64 -d > /tmp/_sess_proxy.py; "
-                "nohup python3 /tmp/_sess_proxy.py >/tmp/_sess_proxy.log 2>&1 & "
+                f"if ! curl -sf -o /dev/null -m 2 {shlex.quote(proxy_base_url + '/health')}; then "
+                f"echo {b64} | base64 -d > {shlex.quote(proxy_runtime_path)}; "
+                f"POLAR_SESSION_PROXY_HOST={shlex.quote(proxy_host)} "
+                f"POLAR_SESSION_PROXY_PORT={shlex.quote(str(proxy_port))} "
+                f"POLAR_SESSION_PROXY_UPSTREAM={shlex.quote(proxy_upstream)} "
+                f"POLAR_SESSION_ROUTES_PATH={shlex.quote(routes_path)} "
+                f"POLAR_SESSION_ROUTES_LOCK_PATH={shlex.quote(routes_lock_path)} "
+                "nohup python3 "
+                f"{shlex.quote(proxy_runtime_path)} >/tmp/_sess_proxy.log 2>&1 & "
                 "for _proxy_i in 1 2 3 4 5 6 7 8 9 10; do "
-                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18100/v1/models && break; sleep 0.2; "
+                f"curl -sf -o /dev/null -m 2 {shlex.quote(proxy_base_url + '/health')} && break; sleep 0.2; "
                 "done "
                 "fi; flock -u 8)"
             )
             proxy_env.append(
                 "for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do "
-                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18100/v1/models && break; sleep 0.5; done"
+                f"curl -sf -o /dev/null -m 2 {shlex.quote(proxy_base_url + '/health')} && break; sleep 0.5; done"
             )
             # Include a per-session marker in the Xyne prompt. This makes
             # routing deterministic even when many samples have identical
@@ -231,7 +247,29 @@ class XyneHarness(BaseHarness):
                 + shlex.quote(routed_instruction_py)
                 + ")"
             )
-            proxy_env.append("export LITELLM_BASE_URL=http://127.0.0.1:18100")
+            route_register_py = (
+                "import fcntl,json,os,time\n"
+                f"path={routes_path!r}\n"
+                f"lock={routes_lock_path!r}\n"
+                "now=time.time()\n"
+                "sid=os.environ['SESSION_ID']\n"
+                "entry={'session_id':sid,'instruction':os.environ['POLAR_ROUTED_INSTRUCTION'],"
+                f"'created':now,'expires':now+{route_ttl_seconds}}}\n"
+                "with open(lock,'a+') as lock_file:\n"
+                " fcntl.flock(lock_file,fcntl.LOCK_EX)\n"
+                " try:\n"
+                "  with open(path) as route_file: routes=json.load(route_file)\n"
+                " except Exception: routes=[]\n"
+                " routes=[item for item in routes if item.get('expires',0)>now "
+                "and item.get('session_id')!=sid]\n"
+                " routes.append(entry)\n"
+                " temp=path+'.tmp.'+str(os.getpid())\n"
+                " with open(temp,'w') as route_file: json.dump(routes,route_file)\n"
+                " os.replace(temp,path)\n"
+            )
+            proxy_env.append(
+                "python3 -c " + shlex.quote(route_register_py)
+            )
         if self.env.get("LITELLM_API_KEY"):
             proxy_env.append(
                 "export LITELLM_API_KEY="
@@ -260,12 +298,16 @@ class XyneHarness(BaseHarness):
             f"python3 {shlex.quote(HELPER_PATH)} ",
             (
                 '--instruction "$POLAR_ROUTED_INSTRUCTION" '
-                if self.env.get("LITELLM_BASE_URL")
+                if proxy_base_url
                 else f"--instruction {shlex.quote(instruction)} "
             ),
             f"--output {shlex.quote(RAW_PATH)} ",
             f"--base-url {shlex.quote(self._base_url)} ",
-            *( ["--agent-id", shlex.quote(self._agent_id)] if self._agent_id else [] ),
+            *(
+                ["--agent-id", shlex.quote(self._agent_id)]
+                if self._agent_id
+                else []
+            ),
             "--timeout 300",
         ]
         # Mint an access JWT (HS256, same algorithm/secret as the backend's
@@ -280,9 +322,15 @@ class XyneHarness(BaseHarness):
             and self._auth_workspace
             and self._env_source
         ):
+            # Under `set -euo pipefail`, `export X=$(cmd)` still returns 0 when
+            # `cmd` emits nothing, so an empty mint silently became an empty
+            # token -> backend 401 -> empty answer. Embed the config secret so
+            # the mint never depends on the runtime env's ACCESS_TOKEN_SECRET,
+            # then verify/retry and FAIL the step rather than run empty.
+            secret = self.env.get("ACCESS_TOKEN_SECRET", "") or ""
             mint_py = (
-                "import hmac,hashlib,base64,json,time,os\n"
-                "s=os.environ['ACCESS_TOKEN_SECRET']\n"
+                "import hmac,hashlib,base64,json,time\n"
+                f"s={secret!r}\n"
                 "def b(b): return base64.urlsafe_b64encode(b).rstrip(b'=').decode()\n"
                 "h=b(json.dumps({'alg':'HS256','typ':'JWT'},separators=(',',':')).encode())\n"
                 f"p={{'sub':{self._auth_email!r},'role':{self._auth_role!r},"
@@ -292,11 +340,27 @@ class XyneHarness(BaseHarness):
                 "sg=b(hmac.new(s.encode(),f'{h}.{pl}'.encode(),hashlib.sha256).digest())\n"
                 "print(f'{h}.{pl}.{sg}')"
             )
-            steps.append(
-                "export XYNE_ACCESS_TOKEN=$(python3 -c "
-                + shlex.quote(mint_py)
-                + ")"
+            mint_cmd = "python3 -c " + shlex.quote(mint_py)
+            mint_and_verify = (
+                "XYNE_ACCESS_TOKEN=\"\"\n"
+                "for _mint_i in 1 2 3 4 5; do\n"
+                "  XYNE_ACCESS_TOKEN=\"$( " + mint_cmd + " 2>/polar/session/mint.err || true )\"\n"
+                "  _tok=\"${XYNE_ACCESS_TOKEN:-}\"\n"
+                "  _dots=\"${_tok//[^.]/}\"\n"
+                "  if [ \"${#_tok}\" -ge 100 ] && [ \"${#_dots}\" -ge 2 ]; then\n"
+                "    break\n"
+                "  fi\n"
+                "  XYNE_ACCESS_TOKEN=\"\"\n"
+                "  sleep 0.2\n"
+                "done\n"
+                "if [ -z \"${XYNE_ACCESS_TOKEN:-}\" ]; then\n"
+                "  echo \"FATAL: XYNE_ACCESS_TOKEN mint produced an empty token after 5 attempts; aborting step\" >&2\n"
+                "  cat /polar/session/mint.err >&2 2>/dev/null || true\n"
+                "  exit 1\n"
+                "fi\n"
+                "export XYNE_ACCESS_TOKEN"
             )
+            steps.append(mint_and_verify)
 
         steps.append(" ".join(helper_args))
         # The helper always writes RAW_PATH (even on error); echo the path
@@ -343,10 +407,24 @@ class XyneHarness(BaseHarness):
                 except Exception:
                     pass
         raw_path = str(result.metadata.get("xyne_raw_path") or RAW_PATH)
-        try:
-            exec_result = await runtime.exec(f"cat {shlex.quote(raw_path)}")
-        except Exception as exc:  # noqa: BLE001 - best-effort collection
-            result.metadata["xyne_raw_error"] = f"read failed: {exc}"
+        # Issue 36: Retry reading the raw flow file a few times.
+        # On session timeout the xyne-server may still be flushing the file.
+        exec_result = None
+        for _attempt in range(3):
+            try:
+                exec_result = await runtime.exec(f"cat {shlex.quote(raw_path)}")
+                if exec_result.return_code == 0 and (exec_result.stdout or "").strip():
+                    break
+            except Exception as exc:  # noqa: BLE001 - best-effort collection
+                if _attempt == 2:
+                    result.metadata["xyne_raw_error"] = f"read failed: {exc}"
+                    return
+            await asyncio.sleep(1.0)
+        if exec_result is None or exec_result.return_code != 0:
+            result.metadata["xyne_raw_error"] = (
+                f"read failed (rc={exec_result.return_code if exec_result else 'no-result'}): "
+                f"{exec_result.stderr if exec_result else 'no raw-flow file written'}"
+            )
             return
 
         if exec_result.return_code != 0:

@@ -1,7 +1,7 @@
 rollout:
   host: 127.0.0.1
-  port: 8080
-  public_url: http://127.0.0.1:8080
+  port: 8081
+  public_url: http://127.0.0.1:8081
   save_dir: /data/siraj/logs/xyne_grpo/rollouts
 
 gateway:
@@ -9,12 +9,12 @@ gateway:
   nodes:
     - id: xyne-node
       host: 127.0.0.1
-      port: 8100
-      public_url: http://127.0.0.1:8100
+      port: 8101
+      public_url: http://127.0.0.1:8101
       max_init_workers: 4
       max_run_workers: 128
       max_postrun_workers: 32
-      model_served: nemotron-30b-a3b
+      model_served: nemotron
       inference:
         engine: sglang
         base_url: http://192.168.111.7:30100

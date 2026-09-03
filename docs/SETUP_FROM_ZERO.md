@@ -48,17 +48,38 @@ Use `configs/polar/polar_credentials.env.example` as the credential template.
 ## 4. Start the service stack
 
 ```bash
+mkdir -p .runtime
+cp configs/polar/polar.env.example .runtime/servers.env
+cat configs/xyne/backend.env.example >> .runtime/servers.env
+cat configs/sglang/server.env.example >> .runtime/servers.env
+cat configs/polar/session-proxy.env.example >> .runtime/servers.env
+# Resolve duplicate keys and fill local non-secret values.
 set -a
 source .runtime/servers.env
 set +a
 
-./scripts/servers/start_xyne_backend.sh
 ./scripts/servers/start_polar.sh
+./scripts/servers/start_session_proxy_v34.sh
+./scripts/servers/start_xyne_backend.sh
 ./scripts/servers/check_stack.sh
 ```
 
 For trainer-managed inference, let Miles own SGLang. For an isolated wiring
 smoke test, start SGLang separately with `scripts/servers/start_sglang.sh`.
+
+The current service wiring is:
+
+```text
+Xyne :3103
+  -> session proxy :18114
+  -> Polar gateway :8101
+  -> Miles SGLang router http://192.168.111.7:30100
+  -> RTX2 GPUs 4-7 (two TP2 engines)
+
+Polar rollout: :8081
+Postgres: 127.0.0.1:15432
+Vespa query/feed: 127.0.0.1:18081 / 18080
+```
 
 ## 5. Start the Ray cluster
 
@@ -83,8 +104,8 @@ bash scripts/cluster/check_ray_12gpu.sh
 ## 6. Run the smoke tests
 
 ```bash
-./scripts/preflight_training.sh
-python -m pytest tests/fast/rollout/test_polar_integrations.py -q
+make test-current
+make preflight-v34
 bash tools/test_without_polar.sh
 ```
 
@@ -96,11 +117,17 @@ python tools/test_with_polar.py
 
 ## 7. Launch training
 
-The recommended multinode launcher is:
+The sanitized current async-microbatch launcher is:
 
 ```bash
 XYNE_RL_CREDENTIALS_FILE=/secure/polar_credentials.env   bash runs/launch_xyne_tp2cp4ep8_multinode.sh
 ```
+
+For the exact current v34 lane, follow
+[CURRENT_RUNBOOK.md](CURRENT_RUNBOOK.md) and use
+`runs/launch_xyne_v34_current.sh`.
+Clone the repository inside the Miles container so its relative Miles and Polar
+package paths resolve, or set `PROJECT_ROOT` and `POLAR_PKG_DIR` explicitly.
 
 Current production-style settings:
 

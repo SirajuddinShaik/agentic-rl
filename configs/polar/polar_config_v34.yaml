@@ -1,0 +1,149 @@
+# Sanitized current Xyne/Polar training configuration.
+#
+# Render this file with envsubst. All credentials and node-specific values are
+# supplied by the environment; do not commit a rendered copy.
+polar_agent_cli_dir: ${AGENT_CLI_DIR}
+polar_callback_host: 127.0.0.1
+polar_gateway_url: ${POLAR_GATEWAY_URL}
+polar_max_async_level: 32
+polar_microbatch_idle_timeout: 1800
+polar_min_complete_accept_fraction: 0.125
+polar_request_timeout: 7200
+polar_reward_key: score
+polar_rollout_url: ${POLAR_ROLLOUT_URL}
+polar_task_id_template: polar-xyne-qa-test-{rollout_id}-{sample.group_index}
+polar_xyne_base_url: ${XYNE_BASE_URL}
+polar_xyne_api_key: "${XYNE_API_KEY}"
+polar_judge_base_url: ${XYNE_JUDGE_BASE_URL}
+polar_judge_api_key: "${JUSPAY_API_KEY}"
+polar_wandb_api_key: "${WANDB_API_KEY}"
+polar_judge_model: ${XYNE_JUDGE_MODEL}
+polar_judge_max_tokens: ${XYNE_JUDGE_MAX_TOKENS}
+polar_judge_max_concurrency: ${XYNE_JUDGE_MAX_CONCURRENCY}
+
+polar_task_template:
+  agent:
+    env:
+      ACCESS_TOKEN_SECRET: "${ACCESS_TOKEN_SECRET}"
+      XYNE_ACCESS_TOKEN: "${XYNE_ACCESS_TOKEN}"
+      XYNE_POLL_TIMEOUT_SECONDS: '7200'
+      POLAR_JUDGE_DUMP_DIR: /polar/session/logs/agent/judge_io
+      DATABASE_HOST: localhost
+      DATABASE_PORT: '15432'
+      DATABASE_URL: "${DATABASE_URL}"
+      JWT_SECRET: "${JWT_SECRET}"
+      LITELLM_API_KEY: dummy-polar-gateway
+      LITELLM_BASE_URL: http://127.0.0.1:18114
+      LITELLM_BEST_AGENTIC_MODEL: nemotron
+      LITELLM_BEST_MODEL: nemotron
+      LITELLM_FAST_MODEL: nemotron
+      LITELLM_SQL_INFERENCE_MODEL: nemotron
+      POLAR_SESSION_PROXY_UPSTREAM: http://127.0.0.1:8101
+      POLAR_SESSION_ROUTES_PATH: /tmp/polar_session_routes.json
+      POLAR_SESSION_ROUTES_LOCK_PATH: /tmp/polar_session_routes.lock
+      POLAR_SESSION_ROUTE_TTL_SECONDS: '3600'
+      NODE_ENV: production
+      HOST: http://localhost:3103
+      GOOGLE_PROD_REDIRECT_URI: http://localhost:3103/v1/auth/callback
+      VESPA_FEED_PORT: '18080'
+      VESPA_HOST: localhost
+      VESPA_QUERY_PORT: '18081'
+      VESPA_REQUIRED: 'false'
+    import_path: polar.xyne.harness:XyneHarness
+    model_name: nemotron
+    settings:
+      api_key: "${XYNE_API_KEY}"
+      base_url: ${XYNE_BASE_URL}
+      boot_port: '3103'
+      health_interval_sec: 2
+      health_timeout_sec: 120
+      server_dir: /workspace/xyne/server/server
+      env_source: /dev/null
+      auth_email: shaik.s@juspay.in
+      auth_role: SuperAdmin
+      auth_workspace: "${XYNE_AUTH_WORKSPACE}"
+      agent_id: nj5ednjmpfx9qt56s6wiocu6
+      skip_boot: true
+
+  builder:
+    strategy: prefix_merging
+
+  evaluator:
+    config:
+      expected_doc_ids: '{sample.metadata.doc_ids}'
+      expected_chunk_ids: '{sample.metadata.chunk_ids}'
+      reference_answer: '{sample.metadata.answer}'
+      judge:
+        base_url: ${XYNE_JUDGE_BASE_URL}
+        api_key: "${JUSPAY_API_KEY}"
+        model: ${XYNE_JUDGE_MODEL}
+        timeout: 120
+        max_tokens: ${XYNE_JUDGE_MAX_TOKENS}
+        max_concurrency: ${XYNE_JUDGE_MAX_CONCURRENCY}
+        dimension_weights:
+          quality: 1.0
+          correctness: 2.0
+          groundedness: 1.5
+          citation_accuracy: 1.5
+      # The v30+ reward contract moves answer quality and evidence credit into
+      # the group reward. Per-session scorers remain observable, but only the
+      # completion gate contributes directly to the raw session score.
+      scorers:
+        - name: completion
+          weight: 1.0
+        - name: answer_format
+          weight: 0.0
+        - name: citation_presence
+          weight: 0.0
+        - name: citation_relevance
+          weight: 0.0
+        - name: citation_accuracy
+          weight: 0.0
+        - name: llm_judge
+          weight: 0.0
+        - name: retrieval_quality
+          weight: 0.0
+        - name: gold_evidence_coverage
+          weight: 0.0
+        - name: citation_evidence_coverage
+          weight: 0.0
+        - name: tool_evidence_utility
+          weight: 0.0
+        - name: subagent_success
+          weight: 0.0
+        - method: f1
+          name: embedding_similarity
+          reference_answer: '{sample.metadata.answer}'
+          weight: 0.0
+        - budget: 8
+          name: tool_call_efficiency
+          weight: 0.0
+        - budget_tokens: 8192
+          input_weight: 0.05
+          name: token_efficiency
+          weight: 0.0
+    strategy: polar.xyne.evaluator:XyneCompositeEvaluator
+
+  runtime:
+    backend: docker
+    import_path: polar.runtime.local:LocalRuntime
+    env:
+      HOME: /polar/session/home
+      PATH: /opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    image: ${XYNE_RUNTIME_IMAGE}
+    kwargs:
+      volumes:
+        - '{args.polar_agent_cli_dir}:/opt/node:ro'
+        - '{args.polar_xyne_server_dir}:/workspace/xyne/server:rw'
+    network: host
+    prepare:
+      - command: mkdir -p /polar/session/logs/agent /polar/session/home
+        type: exec
+    workdir: /polar/session
+  timeout_seconds: 7200
+  group_reward:
+    strategy: best_answer_and_mi
+    weight: 1.0
+    input_weight: 0.05
+
+polar_xyne_server_dir: ${XYNE_SERVER_DIR}

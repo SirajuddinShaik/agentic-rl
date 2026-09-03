@@ -36,8 +36,11 @@ class CitationEvidenceCoverageScorer(XyneScorer):
             enabled=bool(cfg.get("enabled", enabled)),
         )
         self.gold_chunks = expected_chunk_ids(cfg.get("expected_chunk_ids"))
+        values = cfg.get("expected_doc_ids", [])
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            values = []
         self.gold_documents = {
-            str(value) for value in cfg.get("expected_doc_ids", []) if value
+            str(value) for value in values if value
         }
         self.exact_weight = float(cfg.get("exact_weight", 0.5))
         self.vector_provider = vector_provider_from_config(cfg)

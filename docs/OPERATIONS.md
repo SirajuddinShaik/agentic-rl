@@ -6,6 +6,7 @@
 ./scripts/servers/check_stack.sh
 curl -s http://127.0.0.1:8081/health
 curl -s http://127.0.0.1:8101/health
+curl -s http://127.0.0.1:18114/health
 curl -s http://127.0.0.1:30100/health
 ```
 
@@ -14,6 +15,9 @@ curl -s http://127.0.0.1:30100/health
 ```bash
 ray job status <job-id> --address http://192.168.111.7:8265
 ```
+
+For the current v34 lane and exact launch settings, see
+[CURRENT_RUNBOOK.md](CURRENT_RUNBOOK.md).
 
 ## GPU utilization
 
@@ -65,7 +69,11 @@ starting it.
 
 - Multi-turn behavior: count tool calls and tool results per session.
 - Citations: inspect `raw_flow.citations` and citation scorer outputs.
-- Rewards: inspect `reward_components`, `per_scorer`, and `judge_io`.
+- Rewards: inspect `reward.score`,
+  `polar_metadata.trajectory_metadata.evaluation.per_scorer`,
+  `polar_metadata.trajectory_metadata.evaluation.group_reward`,
+  `polar_metadata.trajectory_metadata.evaluation.outcome_reward`, and
+  `judge_io`.
 - Judge truncation: verify `judge_io.*.input.body.max_tokens == 16384`.
 - Session attribution: search Xyne logs for `409 no Polar session matched`.
 - Trainer stalls: compare GPU utilization with `actor_train` timer state.

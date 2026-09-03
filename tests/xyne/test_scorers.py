@@ -785,7 +785,9 @@ async def test_llm_judge_request_body_has_max_tokens_and_labeled_instruction() -
         }
     )
     await override_scorer.score_async(_referenced_flow())
-    assert captured[-1]["max_tokens"] == 1024
+    # The current local Nemotron judge deliberately raises legacy 1k/2k/4k
+    # caps to 16k so reasoning does not truncate before the final score.
+    assert captured[-1]["max_tokens"] == DEFAULT_MAX_TOKENS
 
     system = body["messages"][0]["content"]
     user = body["messages"][1]["content"]

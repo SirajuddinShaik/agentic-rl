@@ -294,15 +294,49 @@ def main(argv: list[str] | None = None) -> int:
         if st < 400:
             items = _as_items(msgs)
             answer, ans_msg_id = _final_assistant_answer(items)
+            # Fast-fail: once the backend has terminated the turn (timeout
+            # / failure), the conversation rows stop growing and the run/turn
+            # status flips terminal but never gains an assistant text. Poll
+            # /dump once per iteration and short-circuit after ~3 consecutive
+            # dead-turn confirmations instead of burning the full poll window.
+            _dead_probe = 0
+            if not answer:
+                try:
+                    _tb = _fetch_dump(
+                        base_url, conversation_id, api_key, access_token,
+                        timeout=args.timeout,
+                    )
+                    if _tb and _main_run_terminal(_tb, flow["run_id"]):
+                        if _main_assistant_answer(_tb)[0]:
+                            answer, ans_msg_id = _main_assistant_answer(_tb)
+                        else:
+                            flow["error"] = (
+                                flow["error"]
+                                or "turn terminated by backend with no "
+                                   "assistant answer (timeout/failed)"
+                            )
+                            break
+                except Exception:
+                    pass
             if answer:
-                # A non-empty assistant text block is the completion signal.
-                # Some deployments do not expose a populated dump endpoint;
-                # when they do, also avoid accepting a non-terminal snapshot.
-                candidate_dump = _fetch_dump(
-                    base_url, conversation_id, api_key, access_token,
-                    timeout=args.timeout,
-                )
-                if not candidate_dump or _main_run_terminal(candidate_dump, flow["run_id"]):
+                # First assistant text is often a planning line ("I'll search…")
+                # before tools run. Only stop once /dump says the main run is
+                # terminal; otherwise keep polling so toolCalls land in the dump.
+                try:
+                    candidate_dump = _fetch_dump(
+                        base_url, conversation_id, api_key, access_token,
+                        timeout=args.timeout,
+                    )
+                except Exception:
+                    candidate_dump = None
+                if candidate_dump and _main_run_terminal(
+                    candidate_dump, flow["run_id"]
+                ):
+                    dump_answer, dump_msg_id = _main_assistant_answer(
+                        candidate_dump
+                    )
+                    if dump_answer:
+                        answer, ans_msg_id = dump_answer, dump_msg_id
                     break
     flow["metadata"]["messages"] = items
     if not answer:
@@ -368,7 +402,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     flow.update(unified)
 
+    # Incomplete agentic: model signaled toolUse / finish_reason=tool_calls but
+    # the dump has no executed tools (and usually only a planning stub answer).
+    # Mark as error so the evaluator failure-gates instead of scoring the stub.
+    incomplete = _incomplete_tool_use(flow)
+    if incomplete:
+        flow["error"] = flow.get("error") or incomplete
+        flow["finish_reason"] = flow.get("finish_reason") or "toolUse"
+        flow.setdefault("metadata", {})["incomplete_agentic"] = incomplete
+
     return _finish(flow, wall_start, args.output)
+
+
+def _incomplete_tool_use(flow: dict[str, Any]) -> str | None:
+    """Return an error string when stopReason is toolUse but no tools ran."""
+    if flow.get("tool_calls") or flow.get("tool_use_blocks"):
+        return None
+    dump = flow.get("raw_dump")
+    if isinstance(dump, dict):
+        tcs = dump.get("toolCalls")
+        if isinstance(tcs, list) and tcs:
+            return None
+    stop: str | None = None
+    for event in flow.get("debug_events") or []:
+        if not isinstance(event, dict):
+            continue
+        raw = event.get("stopReason") or event.get("finish_reason")
+        if isinstance(raw, str) and raw.strip():
+            stop = raw.strip()
+    if not stop:
+        return None
+    normalized = stop.replace("_", "").casefold()
+    if normalized in {"tooluse", "toolcalls"}:
+        return (
+            f"incomplete agentic: stopReason={stop} but toolCalls empty "
+            "(LLM requested tools; backend did not persist/execute them)"
+        )
+    return None
 
 
 def _extract_nested_runs(debug_payload: dict[str, Any] | None) -> list[dict[str, Any]]:

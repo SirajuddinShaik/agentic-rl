@@ -399,7 +399,21 @@ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
     async def evaluate(self, trajectory: Trajectory, **runtime: Any) -> EvalResult:
         raw = trajectory.metadata.get("xyne_raw")
         if raw is None:
-            return EvalResult(outcome_reward=0.0, metadata={"error": "missing xyne_raw"})
+            # Issue 37: Check if partial metadata exists (tool calls, chunks)
+            # even without a full xyne_raw flow. Log the reason for observability.
+            partial_meta = {}
+            traj_meta = trajectory.metadata.get("trajectory_metadata") or {}
+            ev = traj_meta.get("evaluation") or {}
+            if ev.get("result_timeout"):
+                partial_meta["reason"] = "session_timeout"
+            elif trajectory.metadata.get("xyne_raw_error"):
+                partial_meta["reason"] = "raw_read_error"
+                partial_meta["detail"] = str(trajectory.metadata.get("xyne_raw_error"))
+            elif trajectory.metadata.get("xyne_exec_error"):
+                partial_meta["reason"] = "exec_error"
+            else:
+                partial_meta["reason"] = "no_raw_flow"
+            return EvalResult(outcome_reward=0.0, metadata={"error": "missing xyne_raw", **partial_meta})
 
         try:
             flow = _parse_raw(raw)
@@ -455,9 +469,43 @@ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
             scorer_io = pipeline.scorer_details()
         except Exception:
             scorer_io = {}
+        # Include gold/doc IDs and reference in metadata so the trainer can
+        # compute MI, NDCG, gold_coverage, diversity, and shared_answer.
+        # Extract gold IDs from config first
+        gold_meta: dict[str, Any] = {}
+        expected_docs = self.config.get("expected_doc_ids")
+        expected_chunks = self.config.get("expected_chunk_ids")
+        reference = self.config.get("reference_answer")
+        # Fallback: extract gold IDs from the scorer objects themselves
+        if not expected_docs or not expected_chunks:
+            for scorer in getattr(pipeline, "_scorers", []):
+                if scorer.name == "gold_evidence_coverage":
+                    if not expected_chunks and getattr(scorer, "gold_chunks", None):
+                        expected_chunks = sorted(scorer.gold_chunks)
+                    if not expected_docs and getattr(scorer, "gold_documents", None):
+                        expected_docs = sorted(scorer.gold_documents)
+                    break
+        if not reference:
+            for scorer in getattr(pipeline, "_scorers", []):
+                if scorer.name == "embedding_similarity":
+                    ref = getattr(scorer, "reference_answer", None)
+                    if ref:
+                        reference = ref
+                    break
+        expected_docs = self.config.get("expected_doc_ids")
+        expected_chunks = self.config.get("expected_chunk_ids")
+        reference = self.config.get("reference_answer")
+        if expected_docs:
+            gold_meta["expected_doc_ids"] = expected_docs
+        if expected_chunks:
+            gold_meta["gold_chunk_ids"] = expected_chunks
+        if reference:
+            gold_meta["reference_answer"] = reference
+
         metadata: dict[str, Any] = {
             "per_scorer": per_scorer,
             "raw_flow": _trim_flow(flow),
             "scorer_io": scorer_io,
+            **gold_meta,
         }
         return EvalResult(outcome_reward=float(composite), metadata=metadata)

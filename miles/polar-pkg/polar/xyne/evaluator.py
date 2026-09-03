@@ -471,8 +471,6 @@ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
             scorer_io = {}
         # Include gold/doc IDs and reference in metadata so the trainer can
         # compute MI, NDCG, gold_coverage, diversity, and shared_answer.
-        import logging as _log
-        _log.getLogger(__name__).warning("EVALUATOR_CONFIG_DEBUG: expected_doc_ids=%s expected_chunk_ids=%s reference=%s config_keys=%s", self.config.get("expected_doc_ids"), self.config.get("expected_chunk_ids"), str(self.config.get("reference_answer"))[:100], list(self.config.keys()))
         # Extract gold IDs from config first
         gold_meta: dict[str, Any] = {}
         expected_docs = self.config.get("expected_doc_ids")
@@ -480,7 +478,7 @@ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
         reference = self.config.get("reference_answer")
         # Fallback: extract gold IDs from the scorer objects themselves
         if not expected_docs or not expected_chunks:
-            for scorer in pipeline._scorers:
+            for scorer in getattr(pipeline, "_scorers", []):
                 if scorer.name == "gold_evidence_coverage":
                     if not expected_chunks and getattr(scorer, "gold_chunks", None):
                         expected_chunks = sorted(scorer.gold_chunks)
@@ -488,7 +486,7 @@ class XyneCompositeEvaluator(BaseTrajectoryEvaluator):
                         expected_docs = sorted(scorer.gold_documents)
                     break
         if not reference:
-            for scorer in pipeline._scorers:
+            for scorer in getattr(pipeline, "_scorers", []):
                 if scorer.name == "embedding_similarity":
                     ref = getattr(scorer, "reference_answer", None)
                     if ref:

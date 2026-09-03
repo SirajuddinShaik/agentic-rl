@@ -15,6 +15,7 @@ import json
 import asyncio
 import shlex
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentRunResult
@@ -121,6 +122,43 @@ class XyneHarness(BaseHarness):
     # ------------------------------------------------------------------
     def run_steps(self, instruction: str) -> list[ExecInput]:
         api_key_env = self._api_key
+        proxy_base_url = str(self.env.get("LITELLM_BASE_URL", "")).rstrip("/")
+        proxy_url = urlsplit(proxy_base_url) if proxy_base_url else None
+        if proxy_url is not None:
+            if proxy_url.scheme != "http" or proxy_url.hostname not in {
+                "127.0.0.1",
+                "localhost",
+                "::1",
+            }:
+                raise ValueError(
+                    "LITELLM_BASE_URL must point to the local Polar session proxy"
+                )
+            if proxy_url.path not in ("", "/"):
+                raise ValueError(
+                    "LITELLM_BASE_URL must be a base URL without /v1 or another path"
+                )
+            proxy_port = proxy_url.port or 80
+            proxy_host = "127.0.0.1"
+            proxy_upstream = str(
+                self.env.get(
+                    "POLAR_SESSION_PROXY_UPSTREAM", "http://127.0.0.1:8101"
+                )
+            ).rstrip("/")
+            routes_path = str(
+                self.env.get(
+                    "POLAR_SESSION_ROUTES_PATH",
+                    "/tmp/polar_session_routes.json",
+                )
+            )
+            routes_lock_path = str(
+                self.env.get(
+                    "POLAR_SESSION_ROUTES_LOCK_PATH",
+                    "/tmp/polar_session_routes.lock",
+                )
+            )
+            route_ttl_seconds = int(
+                self.env.get("POLAR_SESSION_ROUTE_TTL_SECONDS", "3600")
+            )
 
         # Quoted heredoc delimiter → XyneFetchEOF content is verbatim (the
         # helper uses ``$``/backticks that must not be expanded by bash).
@@ -162,30 +200,37 @@ class XyneHarness(BaseHarness):
         # fail to bind or attribute completions to the first session. Each run
         # registers its instruction; the proxy selects the matching session
         # from the outgoing chat-completions request body.
-        # This MUST run even when skip_boot=True (persistent backend), because
-        # the persistent TEST backend is started with LITELLM_BASE_URL=:18113.
+        # This MUST run even when skip_boot=True (persistent backend). The
+        # proxy URL comes from the task environment, so the current :18114
+        # lane and isolated test lanes use the same packaged implementation.
         proxy_env = ["true"]
-        if self.env.get("LITELLM_BASE_URL"):
+        if proxy_base_url:
             proxy_code = self._render_proxy_source()
 
             b64 = base64.b64encode(proxy_code.encode()).decode()
+            proxy_runtime_path = f"/tmp/_sess_proxy_{proxy_port}.py"
             proxy_env.append(
-                # Initialize the one shared TEST proxy once. The lock is held
-                # only during startup, never for the duration of an agent turn.
-                # Port :18113 (not :18100) keeps the TEST lane off the prod
-                # backend's shared LITELLM_BASE_URL=:18100 hop.
+                # Initialize the one shared proxy once. The lock is held only
+                # during startup, never for the duration of an agent turn. An
+                # already-running persistent proxy is left untouched.
                 "(exec 8>/tmp/polar_proxy_init.lock; flock 8; "
-                "if ! curl -sf -o /dev/null -m 2 http://127.0.0.1:18113/health; then "
-                f"echo {b64} | base64 -d > /tmp/_sess_proxy.py; "
-                "nohup python3 /tmp/_sess_proxy.py >/tmp/_sess_proxy.log 2>&1 & "
+                f"if ! curl -sf -o /dev/null -m 2 {shlex.quote(proxy_base_url + '/health')}; then "
+                f"echo {b64} | base64 -d > {shlex.quote(proxy_runtime_path)}; "
+                f"POLAR_SESSION_PROXY_HOST={shlex.quote(proxy_host)} "
+                f"POLAR_SESSION_PROXY_PORT={shlex.quote(str(proxy_port))} "
+                f"POLAR_SESSION_PROXY_UPSTREAM={shlex.quote(proxy_upstream)} "
+                f"POLAR_SESSION_ROUTES_PATH={shlex.quote(routes_path)} "
+                f"POLAR_SESSION_ROUTES_LOCK_PATH={shlex.quote(routes_lock_path)} "
+                "nohup python3 "
+                f"{shlex.quote(proxy_runtime_path)} >/tmp/_sess_proxy.log 2>&1 & "
                 "for _proxy_i in 1 2 3 4 5 6 7 8 9 10; do "
-                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18113/health && break; sleep 0.2; "
+                f"curl -sf -o /dev/null -m 2 {shlex.quote(proxy_base_url + '/health')} && break; sleep 0.2; "
                 "done "
                 "fi; flock -u 8)"
             )
             proxy_env.append(
                 "for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do "
-                "curl -sf -o /dev/null -m 2 http://127.0.0.1:18113/health && break; sleep 0.5; done"
+                f"curl -sf -o /dev/null -m 2 {shlex.quote(proxy_base_url + '/health')} && break; sleep 0.5; done"
             )
             # Include a per-session marker in the Xyne prompt. This makes
             # routing deterministic even when many samples have identical
@@ -204,12 +249,12 @@ class XyneHarness(BaseHarness):
             )
             route_register_py = (
                 "import fcntl,json,os,time\n"
-                "path='/tmp/polar_session_routes.json'\n"
-                "lock='/tmp/polar_session_routes.lock'\n"
+                f"path={routes_path!r}\n"
+                f"lock={routes_lock_path!r}\n"
                 "now=time.time()\n"
                 "sid=os.environ['SESSION_ID']\n"
                 "entry={'session_id':sid,'instruction':os.environ['POLAR_ROUTED_INSTRUCTION'],"
-                "'created':now,'expires':now+3600}\n"
+                f"'created':now,'expires':now+{route_ttl_seconds}}}\n"
                 "with open(lock,'a+') as lock_file:\n"
                 " fcntl.flock(lock_file,fcntl.LOCK_EX)\n"
                 " try:\n"
@@ -225,7 +270,6 @@ class XyneHarness(BaseHarness):
             proxy_env.append(
                 "python3 -c " + shlex.quote(route_register_py)
             )
-            proxy_env.append("export LITELLM_BASE_URL=http://127.0.0.1:18113")
         if self.env.get("LITELLM_API_KEY"):
             proxy_env.append(
                 "export LITELLM_API_KEY="
@@ -254,7 +298,7 @@ class XyneHarness(BaseHarness):
             f"python3 {shlex.quote(HELPER_PATH)} ",
             (
                 '--instruction "$POLAR_ROUTED_INSTRUCTION" '
-                if self.env.get("LITELLM_BASE_URL")
+                if proxy_base_url
                 else f"--instruction {shlex.quote(instruction)} "
             ),
             f"--output {shlex.quote(RAW_PATH)} ",

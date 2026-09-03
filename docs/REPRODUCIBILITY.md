@@ -10,6 +10,18 @@ This repository captures the current live RTX1 worktrees:
 
 The reviewable local diffs are stored under `patches/`.
 
+The current v34 training lane is reproduced without credentials by:
+
+- `configs/polar/polar_config_v34.yaml`
+- `runs/launch_xyne_v34_current.sh`
+- `scripts/servers/start_session_proxy_v34.sh`
+- `configs/polar/session-proxy.env.example`
+- [CURRENT_RUNBOOK.md](CURRENT_RUNBOOK.md)
+
+The Polar source tree, installable `polar-pkg/` tree, and Miles runtime package
+are synchronized for the Xyne harness, session proxy, evaluator, and local
+Nemotron judge. `tests/test_current_v34_repro.py` fails if these copies drift.
+
 ## Audited runtime
 
 The active Miles container used:
@@ -34,6 +46,15 @@ The active Polar runtime image was:
 ```text
 sha256:3dc40f6b6bead90e6778eb1f44664cf250abbe21db35f54f52c0db1e01585966
 ```
+
+## Current dump validation
+
+On 2026-09-03, the newest four v34 group dumps passed
+`tools/reward/audit_current_dumps.py`: 642 records across 32 sessions, 535
+completed and 107 truncated, 4,988 tool calls, 1,790 citations, 5,630 reasoning
+blocks, 34,876 retrieved chunks, 458,835 trainable tokens, and 16,384 judge
+max tokens for every judge record. The mean of the four group-file means was
+0.702903.
 
 ## Reproduction warning
 

@@ -66,7 +66,7 @@ DEFAULT_TIMEOUT = 10.0
 # Minimum max_tokens guard: the production judge (glm-flash-experimental)
 # emits a long reasoning_content (CoT) block before content, so a tiny cap
 # truncates before the final `Score:` and yields null content -> 0.0.
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 16384
 _MIN_MAX_TOKENS = 64
 
 _JUDGE_SYSTEM_PROMPT = (
@@ -217,6 +217,11 @@ class LLMJudgeScorer(XyneScorer):
             self._max_tokens = DEFAULT_MAX_TOKENS
         if self._max_tokens < _MIN_MAX_TOKENS:
             self._max_tokens = _MIN_MAX_TOKENS
+        # Local Nemotron judge can emit long reasoning before the final score.
+        # Raise legacy 2048/4096 task configs so citation/groundedness do not
+        # truncate to empty content.
+        if self._max_tokens < DEFAULT_MAX_TOKENS:
+            self._max_tokens = DEFAULT_MAX_TOKENS
 
         raw_max_concurrency = cfg.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
         try:

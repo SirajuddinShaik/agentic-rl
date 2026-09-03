@@ -29,3 +29,6 @@ git apply --3way /path/to/agentic-rl/patches/<patch-file>
 - Untracked new files are already present in this repository under the
   corresponding source directories.
 - The source directories in this repository are the primary source of truth.
+- The patch files are capture-time provenance. Later monorepo hardening (for
+  example the reproducible session proxy) may put the repository ahead of those
+  patches; use the repository source trees for the current system.

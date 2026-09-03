@@ -21,6 +21,7 @@ operational handouts built during the recent training runs.
 | `miles/` | Live Miles training source, launch scripts, and tests |
 | `miles-pr/` | Slim Miles PR overlay for upstream review |
 | `configs/` | Environment templates and topology configs |
+| `runs/launch_xyne_v34_current.sh` | Sanitized current async-microbatch v34 training launcher |
 | `scripts/` | Setup, preflight, server, and cluster scripts |
 | `runs/` | Launch scripts for single-node and multinode training |
 | `tests/` | Focused integration and reward tests |
@@ -48,11 +49,19 @@ cp .env.example .env
 Run the lightweight checks:
 
 ```bash
-./scripts/check_env.sh
-python -m compileall -q polar-pkg miles tests tools
-python -m pytest tests/fast/rollout/test_polar_integrations.py -q
-bash -n scripts/*.sh runs/*.sh miles/examples/polar_swegym_grpo/*.sh tools/*.sh
+make check
+make test
+make test-current
 ```
+
+The repository is organized as a runnable monorepo, not a passive archive:
+
+1. Use `make check` for local syntax and import validation.
+2. Use `make test-current` to lock the current v34 config and launcher contract.
+3. On RTX1, export the credential template and run `make preflight-v34`.
+4. Start the current lane with `runs/launch_xyne_v34_current.sh`.
+5. Monitor with `make status-v34` and audit dumps with
+   `make audit-dumps DUMP_ROOT=/root/miles/tmp/.../trajectory_dumps`.
 
 The full GPU runtime also needs Docker, CUDA, PyTorch, Ray, Megatron,
 Transformer Engine, SGLang, Bun, Vespa, and Postgres from the target RTX
@@ -77,7 +86,11 @@ Vespa / Postgres
         |
         | full conversation dump
         v
-Polar gateway + evaluator
+Session proxy (:18114)
+        |
+        | deterministic session attribution
+        v
+Polar gateway (:8101) + evaluator
         |
         | reward + masked trajectory
         v
@@ -88,12 +101,17 @@ Miles actor update
 SGLang inference
 ```
 
+The current lane's non-secret endpoints are Xyne `:3103`, Polar rollout
+`:8081`, Polar gateway `:8101`, session proxy `:18114`, and the Miles-managed
+SGLang router at `http://192.168.111.7:30100` from RTX1.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Setup from zero](docs/SETUP_FROM_ZERO.md)
 - [Custom logic and local changes](docs/CUSTOM_LOGIC.md)
 - [Operations and monitoring](docs/OPERATIONS.md)
+- [Current v34 runbook](docs/CURRENT_RUNBOOK.md)
 - [Reproducibility and provenance](docs/REPRODUCIBILITY.md)
 - [Patch guide](patches/README.md)
 - [Historical handouts](docs/history/)

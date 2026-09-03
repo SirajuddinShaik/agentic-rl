@@ -45,6 +45,11 @@ The important custom logic is in `polar/src/polar/` and the packaged copy in
 - Gateway streams and aggregates OpenAI-compatible responses without stripping
   `tool_calls` or `reasoning_content`.
 - Session proxy uses deterministic Polar session markers and serialized startup.
+- Session proxy is configurable for the current `:18114 -> :8101` lane, keeps
+  tool-bearing requests streaming for the `qwen3_coder` parser, synthesizes SSE
+  for tool-free streaming requests, and guards requests at 16,384 output tokens.
+- The source, installable package, and Miles runtime package copies are kept
+  synchronized and covered by `tests/test_current_v34_repro.py`.
 - Xyne harness fetches the authoritative `/dump` flow and preserves:
   - messages
   - reasoning
@@ -70,6 +75,7 @@ Key files:
 - `src/polar/gateway/proxy.py`
 - `src/polar/gateway/node.py`
 - `src/polar/xyne/harness.py`
+- `src/polar/xyne/session_proxy.py`
 - `src/polar/xyne/xyne_fetch_flow.py`
 - `src/polar/xyne/evaluator.py`
 - `src/polar/xyne/scorers/llm_judge.py`

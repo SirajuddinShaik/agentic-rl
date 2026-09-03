@@ -8,11 +8,12 @@ dependencies first, then XYNE, then Polar, and finally Miles.
 | 1 | Postgres | `127.0.0.1:15432` | XYNE persistence and agent/tool config |
 | 2 | Vespa | query `:18081`, feed `:18080` | retrieval and chunk metadata |
 | 3 | Optional TEI reranker | `:18002` | reranking only when explicitly wired |
-| 4 | SGLang | `http://127.0.0.1:30100` | policy inference |
-| 5 | XYNE backend | `http://127.0.0.1:3001` | agent loop, tools, and `/dump` |
-| 6 | Polar rollout | `http://127.0.0.1:8080` | tasks and trajectory state |
-| 7 | Polar gateway | `http://127.0.0.1:8100` | attribution and inference proxy |
-| 8 | Miles | trainer process | GRPO and Megatron actor updates |
+| 4 | SGLang | `http://192.168.111.7:30100` from RTX1 | policy inference |
+| 5 | Polar rollout | `http://127.0.0.1:8081` | tasks and trajectory state |
+| 6 | Polar gateway | `http://127.0.0.1:8101` | attribution and inference proxy |
+| 7 | Session proxy | `http://127.0.0.1:18114` | Xyne LLM calls and session attribution |
+| 8 | XYNE backend | `http://127.0.0.1:3103` | agent loop, tools, and `/dump` |
+| 9 | Miles | trainer process | GRPO and Megatron actor updates |
 
 ## Configure
 
@@ -23,6 +24,7 @@ mkdir -p .runtime
 cp configs/polar/polar.env.example .runtime/servers.env
 cat configs/xyne/backend.env.example >> .runtime/servers.env
 cat configs/sglang/server.env.example >> .runtime/servers.env
+cat configs/polar/session-proxy.env.example >> .runtime/servers.env
 ```
 
 Resolve duplicate values and fill secrets locally, then load them:
@@ -42,8 +44,9 @@ For an isolated wiring smoke:
 
 ```bash
 ./scripts/servers/start_sglang.sh
-./scripts/servers/start_xyne_backend.sh
 ./scripts/servers/start_polar.sh
+./scripts/servers/start_session_proxy_v34.sh
+./scripts/servers/start_xyne_backend.sh
 ./scripts/servers/check_stack.sh
 ```
 
@@ -59,11 +62,14 @@ The live schema must provide `document-summary lean` plus the
 match indexed data. These scripts verify health but deliberately do not deploy
 or mutate Vespa schemas.
 
-## Shared Proxy
+## Shared session proxy
 
-`XyneHarness` owns the session-aware proxy on `127.0.0.1:18100`. Startup is
-serialized and requests carry an embedded Polar session marker. Do not start
-one proxy per rollout container on the same host port.
+The current lane uses one session-aware proxy on `127.0.0.1:18114`, forwarding
+to the Polar gateway on `:8101`. Startup is serialized and requests carry an
+embedded Polar session marker. Tool-bearing streaming requests stay streaming
+so SGLang's `qwen3_coder` parser can emit complete tool calls; tool-free
+streaming requests are made non-streaming and SSE is synthesized for Xyne.
+Do not start one proxy per rollout container on the same host port.
 
 ## Scale
 

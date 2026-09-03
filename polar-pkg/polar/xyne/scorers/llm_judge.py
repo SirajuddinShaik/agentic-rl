@@ -66,7 +66,7 @@ DEFAULT_TIMEOUT = 10.0
 # Minimum max_tokens guard: the production judge (glm-flash-experimental)
 # emits a long reasoning_content (CoT) block before content, so a tiny cap
 # truncates before the final `Score:` and yields null content -> 0.0.
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 16384
 _MIN_MAX_TOKENS = 64
 
 _JUDGE_SYSTEM_PROMPT = (
@@ -217,6 +217,11 @@ class LLMJudgeScorer(XyneScorer):
             self._max_tokens = DEFAULT_MAX_TOKENS
         if self._max_tokens < _MIN_MAX_TOKENS:
             self._max_tokens = _MIN_MAX_TOKENS
+        # Local Nemotron judge can emit long reasoning before the final score.
+        # Raise legacy 2048/4096 task configs so citation/groundedness do not
+        # truncate to empty content.
+        if self._max_tokens < DEFAULT_MAX_TOKENS:
+            self._max_tokens = DEFAULT_MAX_TOKENS
 
         raw_max_concurrency = cfg.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
         try:
@@ -270,11 +275,19 @@ class LLMJudgeScorer(XyneScorer):
         citations = _render_citations(flow.citations, flow=flow)
         question = _first_question(flow.request_messages)
         reference = self._reference_answer(flow)
-        reference_block = (
-            f"\nReference (ground truth) answer: {reference}\n"
-            if reference
-            else ""
-        )
+
+        # Build reference block with ground truth answer + gold doc/chunk IDs
+        gold_doc_ids = flow.metadata.get("expected_doc_ids") or flow.metadata.get("gold_doc_ids") or []
+        gold_chunk_ids = flow.metadata.get("expected_chunk_ids") or flow.metadata.get("gold_chunk_ids") or []
+        reference_parts = []
+        if reference:
+            reference_parts.append(f"Reference (ground truth) answer: {reference}")
+        if gold_doc_ids:
+            reference_parts.append(f"Ground truth document IDs: {', '.join(str(d) for d in gold_doc_ids)}")
+        if gold_chunk_ids:
+            reference_parts.append(f"Ground truth chunk IDs: {', '.join(str(c) for c in gold_chunk_ids)}")
+        reference_block = ("\n" + "\n".join(reference_parts) + "\n") if reference_parts else ""
+
         user_content = self._prompt_template.format(
             question=question,
             answer=flow.answer,

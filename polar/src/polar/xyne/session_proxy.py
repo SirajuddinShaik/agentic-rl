@@ -8,11 +8,11 @@ rollout session.
 It runs with a bare ``python3`` inside the agent runtime container, so it imports
 **only the stdlib**. It does two jobs:
 
-  1. ``stream:true -> stream:false`` rewrite. The gateway makes one non-streaming
-     backend call. Sending ``stream:true`` to SGLang holds its thinking buffer
-     open and the call stalls; rewriting to a non-streaming request and
-     synthesizing a proper SSE stream back keeps LiteLLM's streaming contract
-     while letting every call terminate cleanly.
+  1. Streaming-mode rewrite. Tool requests keep ``stream:true`` because the
+     SGLang ``qwen3_coder`` parser emits complete tool-call deltas only in
+     streaming mode. Tool-free requests are made non-streaming and a proper SSE
+     stream is synthesized back, keeping LiteLLM's contract while avoiding the
+     old SGLang thinking-buffer stall.
 
   2. Per-request session attribution. The proxy may be shared across many
      concurrent rollout sessions (``n_samples_per_prompt > 1``), so it must
@@ -44,23 +44,53 @@ byte-for-byte the proxy that runs.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
-PROXY_HOST = "127.0.0.1"
-# TEST-STACK isolation: prod backend often keeps LITELLM_BASE_URL=:18100.
-# Bind the Polar TEST session proxy on :18113 → gateway :8181 so prod traffic
-# on :18100 cannot starve the shared grid quota / test gateway.
-PROXY_PORT = 18113
-UPSTREAM_HOST = "127.0.0.1"
-UPSTREAM_PORT = 8101
 
-ROUTES_PATH = "/tmp/polar_session_routes.json"
-LOCK_PATH = "/tmp/polar_session_routes.lock"
+def _positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer override or return the tested default."""
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer, got {value!r}") from exc
+    if result <= 0:
+        raise SystemExit(f"{name} must be positive, got {result}")
+    return result
+
+
+# The current Xyne/Polar training lane binds the shared session proxy on
+# :18114 and forwards to the Polar gateway on :8101. These values remain
+# configurable so the same stdlib-only proxy can support isolated test lanes.
+PROXY_HOST = os.environ.get("POLAR_SESSION_PROXY_HOST", "127.0.0.1")
+PROXY_PORT = _positive_env_int("POLAR_SESSION_PROXY_PORT", 18114)
+UPSTREAM_URL = os.environ.get(
+    "POLAR_SESSION_PROXY_UPSTREAM", "http://127.0.0.1:8101"
+).rstrip("/")
+_UPSTREAM = urlsplit(UPSTREAM_URL)
+
+ROUTES_PATH = os.environ.get(
+    "POLAR_SESSION_ROUTES_PATH", "/tmp/polar_session_routes.json"
+)
+LOCK_PATH = os.environ.get(
+    "POLAR_SESSION_ROUTES_LOCK_PATH", "/tmp/polar_session_routes.lock"
+)
+REQUEST_TIMEOUT_SECONDS = _positive_env_int(
+    "POLAR_SESSION_PROXY_TIMEOUT_SECONDS", 7200
+)
+DEFAULT_MAX_TOKENS = _positive_env_int(
+    "POLAR_SESSION_PROXY_DEFAULT_MAX_TOKENS", 16384
+)
+MAX_TOKENS = _positive_env_int("POLAR_SESSION_PROXY_MAX_TOKENS", 16384)
 _MARKER_RE = re.compile(r"\[polar-session:([^\]\r\n]+)\]")
 _SESSION_HEADER_NAMES = ("proxy-x-session-id", "x-session-id", "x_session_id")
 # Request headers stripped before forwarding upstream (session identity and
@@ -228,6 +258,56 @@ def synth_sse(body: bytes) -> bytes | None:
         return out
     except Exception:
         return None
+
+
+def rewrite_chat_request(body: bytes) -> tuple[bytes, bool, bool]:
+    """Normalize a chat request and report its required response mode.
+
+    Returns ``(body, want_stream, tools_stream)``. Tool requests must keep
+    ``stream=true`` upstream: SGLang's ``qwen3_coder`` tool-call parser emits
+    complete tool-call deltas while streaming. Requests without tools are made
+    non-streaming and ``synth_sse`` restores the OpenAI streaming contract to
+    Xyne. The 16,384-token guard prevents an unbounded Xyne request from
+    exceeding the 80k engine context.
+    """
+    try:
+        request = json.loads(body.decode("utf-8", "replace"))
+        if not isinstance(request, dict):
+            return body, False, False
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body, False, False
+
+    want_stream = bool(request.get("stream"))
+    tools_stream = want_stream and isinstance(request.get("tools"), list) and bool(request["tools"])
+    rewritten = False
+    if want_stream:
+        request["stream"] = tools_stream
+        request.pop("stream_options", None)
+        rewritten = True
+
+    max_tokens = request.get("max_tokens")
+    try:
+        if max_tokens in (None, ""):
+            completion_tokens = request.get("max_completion_tokens")
+            max_tokens = (
+                int(completion_tokens)
+                if completion_tokens not in (None, "") and int(completion_tokens) > 0
+                else DEFAULT_MAX_TOKENS
+            )
+        else:
+            max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = DEFAULT_MAX_TOKENS
+    if max_tokens <= 0:
+        max_tokens = DEFAULT_MAX_TOKENS
+    request["max_tokens"] = min(max_tokens, MAX_TOKENS)
+    rewritten = True
+
+    if not rewritten:
+        return body, want_stream, tools_stream
+    return json.dumps(request).encode("utf-8"), want_stream, tools_stream
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -241,34 +321,9 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get('Content-Length') or 0)
         b = self.rfile.read(n) if n else None
         want_stream = False
+        tools_stream = False
         if self.command == 'POST' and b:
-            try:
-                pj = json.loads(b.decode('utf-8', 'replace'))
-                want_stream = bool(pj.get('stream'))
-                rewritten = False
-                if want_stream:
-                    pj['stream'] = False
-                    pj.pop('stream_options', None)
-                    rewritten = True
-                # Unbounded / huge max_tokens wedges SGLang (health OK, chat hangs).
-                mt = pj.get('max_tokens')
-                if mt is None or mt == '' or (isinstance(mt, (int, float)) and int(mt) <= 0):
-                    mct = pj.get('max_completion_tokens')
-                    if mct not in (None, '') and int(mct) > 0:
-                        pj['max_tokens'] = int(mct)
-                    else:
-                        pj["max_tokens"] = 16384
-                    rewritten = True
-                try:
-                    if int(pj.get("max_tokens") or 0) > 16384:
-                        pj["max_tokens"] = 16384
-                        rewritten = True
-                except (TypeError, ValueError):
-                    pass
-                if rewritten:
-                    b = json.dumps(pj).encode()
-            except Exception:
-                want_stream = False
+            b, want_stream, tools_stream = rewrite_chat_request(b)
         sid = resolve_session_id(b or b'', headers=self.headers)
         public_models = self.command == 'GET' and self.path.startswith('/v1/models')
         if not sid and not public_models:
@@ -277,7 +332,7 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'no Polar session matched')
             return
-        u = f'http://{UPSTREAM_HOST}:{UPSTREAM_PORT}' + self.path
+        u = UPSTREAM_URL + self.path
         r = urllib.request.Request(u, data=b, method=self.command)
         if b is not None:
             r.add_header('Content-Length', str(len(b)))
@@ -289,8 +344,17 @@ class H(BaseHTTPRequestHandler):
             r.add_header('authorization', 'Bearer ' + sid)
             r.add_header('x-session-id', sid)
         try:
-            with urllib.request.urlopen(r, timeout=7200) as resp:
+            with urllib.request.urlopen(r, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
                 body = resp.read()
+                if tools_stream and self.path.rstrip('/').endswith('/v1/chat/completions'):
+                    # SGLang already returned real SSE tool-call deltas. Forward
+                    # them verbatim so the parser output is not reconstructed.
+                    self.send_response(200)
+                    self.send_header('content-type', 'text/event-stream; charset=utf-8')
+                    self.send_header('content-length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if want_stream and self.path.rstrip('/').endswith('/v1/chat/completions'):
                     sse = synth_sse(body)
                     if sse is not None:
@@ -319,7 +383,10 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
 
-    do_GET = _p; do_POST = _p; do_PUT = _p; do_DELETE = _p
+    do_GET = _p
+    do_POST = _p
+    do_PUT = _p
+    do_DELETE = _p
 
     def log_message(self, *a, **k):
         pass
