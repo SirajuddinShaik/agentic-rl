@@ -107,6 +107,7 @@ SGLang router at `http://192.168.111.7:30100` from RTX1.
 
 ## Documentation
 
+- [Generic agentic RL algorithm and pipeline](docs/GENERIC_AGENTIC_RL.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Setup from zero](docs/SETUP_FROM_ZERO.md)
 - [Custom logic and local changes](docs/CUSTOM_LOGIC.md)

@@ -3,6 +3,7 @@
 ## Start here
 
 - [README](../README.md)
+- [Generic agentic RL algorithm and pipeline](GENERIC_AGENTIC_RL.md)
 - [Architecture](ARCHITECTURE.md)
 - [Setup from zero](SETUP_FROM_ZERO.md)
 - [Custom logic and local changes](CUSTOM_LOGIC.md)
