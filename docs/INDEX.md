@@ -17,6 +17,7 @@
 - [Reward signals](XYNE_POLAR_REWARD_SIGNALS_HANDOUT.md)
 - [Current consolidated state](CURRENT_STATE.md)
 - [Training setup audit](TRAINING_SETUP_AUDIT.md)
+- [Remote Miles container setup](../scripts/setup_miles_container.sh)
 - [RTX1 runtime manifest](RTX1_RUNTIME_MANIFEST.md)
 
 ## Historical context

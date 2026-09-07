@@ -63,6 +63,15 @@ The repository is organized as a runnable monorepo, not a passive archive:
 5. Monitor with `make status-v34` and audit dumps with
    `make audit-dumps DUMP_ROOT=/root/miles/tmp/.../trajectory_dumps`.
 
+To build and start an idle Miles container on another GPU node from this
+repository's sanitized Miles/Polar overlay, use:
+
+```bash
+scripts/setup_miles_container.sh --host tata06 --gpus 0,1,2,3
+```
+
+The equivalent Make target is `make setup-miles-tata06`.
+
 The full GPU runtime also needs Docker, CUDA, PyTorch, Ray, Megatron,
 Transformer Engine, SGLang, Bun, Vespa, and Postgres from the target RTX
 environment.
