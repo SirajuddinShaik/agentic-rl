@@ -47,6 +47,19 @@ The active Polar runtime image was:
 sha256:3dc40f6b6bead90e6778eb1f44664cf250abbe21db35f54f52c0db1e01585966
 ```
 
+## Local bootstrap
+
+A clean checkout can be prepared with:
+
+```bash
+make bootstrap
+```
+
+This creates `.venv`, installs the lightweight development dependencies, and
+copies `.env.example` to a private `.env`. GPU services still require the
+pinned Miles image, external model/data artifacts, credentials, Docker with
+the NVIDIA runtime, and the topology documented in `SETUP_FROM_ZERO.md`.
+
 ## Current dump validation
 
 On 2026-09-03, the newest four v34 group dumps passed

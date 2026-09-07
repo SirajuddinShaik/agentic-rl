@@ -27,7 +27,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 REMOTE_TARGET="${REMOTE_TARGET:-tata06}"
 REMOTE_STAGE="${REMOTE_STAGE:-/data/aicloud/agentic-rl-miles-overlay}"
-BASE_IMAGE="${BASE_IMAGE:-radixark/miles:latest}"
+BASE_IMAGE="${BASE_IMAGE:-radixark/miles@sha256:08be00658cd24eaa364ca4ad0b1a3911dfbe4adc04fd0c148e4241402fb40812}"
 IMAGE_TAG="${IMAGE_TAG:-agentic-rl/miles-overlay:current}"
 CONTAINER_NAME="${CONTAINER_NAME:-miles-tata06-overlay}"
 GPU_DEVICES="${GPU_DEVICES:-0,1,2,3}"
@@ -58,7 +58,7 @@ Options:
   --gpus DEVICES       Comma-separated GPU devices (default: 0,1,2,3)
   --container NAME     New container name (default: miles-tata06-overlay)
   --image TAG          Built image tag (default: agentic-rl/miles-overlay:current)
-  --base-image IMAGE   Upstream Miles base image (default: radixark/miles:latest)
+  --base-image IMAGE   Upstream Miles base image (default: pinned digest in this repo)
   --stage PATH         Remote staging directory
   --no-pull            Do not pull the base image
   --no-tests           Skip in-container validation

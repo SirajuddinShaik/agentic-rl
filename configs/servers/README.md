@@ -8,11 +8,11 @@ dependencies first, then XYNE, then Polar, and finally Miles.
 | 1 | Postgres | `127.0.0.1:15432` | XYNE persistence and agent/tool config |
 | 2 | Vespa | query `:18081`, feed `:18080` | retrieval and chunk metadata |
 | 3 | Optional TEI reranker | `:18002` | reranking only when explicitly wired |
-| 4 | SGLang | `http://192.168.111.7:30100` from RTX1 | policy inference |
-| 5 | Polar rollout | `http://127.0.0.1:8081` | tasks and trajectory state |
-| 6 | Polar gateway | `http://127.0.0.1:8101` | attribution and inference proxy |
-| 7 | Session proxy | `http://127.0.0.1:18114` | Xyne LLM calls and session attribution |
-| 8 | XYNE backend | `http://127.0.0.1:3103` | agent loop, tools, and `/dump` |
+| 4 | SGLang | `http://100.64.0.149:30100` | policy inference |
+| 5 | Polar rollout | `http://100.64.0.126:8081` | tasks and trajectory state |
+| 6 | Polar gateway | `http://100.64.0.126:8101` | attribution and inference proxy |
+| 7 | Session proxy | `http://100.64.0.126:18114` | Xyne LLM calls and session attribution |
+| 8 | XYNE backend | `http://100.64.0.126:3103` | agent loop, tools, and `/dump` |
 | 9 | Miles | trainer process | GRPO and Megatron actor updates |
 
 ## Configure

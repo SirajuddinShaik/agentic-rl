@@ -67,16 +67,23 @@ set +a
 For trainer-managed inference, let Miles own SGLang. For an isolated wiring
 smoke test, start SGLang separately with `scripts/servers/start_sglang.sh`.
 
+RTX1 keeps Polar and Xyne services loopback-only by default. Before a remote
+trainer or dashboard connects over Tailscale, run:
+
+```bash
+make expose-rtx1-tailscale
+```
+
 The current service wiring is:
 
 ```text
-Xyne :3103
-  -> session proxy :18114
-  -> Polar gateway :8101
-  -> Miles SGLang router http://192.168.111.7:30100
+Xyne http://100.64.0.126:3103
+  -> session proxy http://100.64.0.126:18114
+  -> Polar gateway http://100.64.0.126:8101
+  -> SGLang router http://100.64.0.149:30100
   -> RTX2 GPUs 4-7 (two TP2 engines)
 
-Polar rollout: :8081
+Polar rollout: http://100.64.0.126:8081
 Postgres: 127.0.0.1:15432
 Vespa query/feed: 127.0.0.1:18081 / 18080
 ```

@@ -26,7 +26,7 @@ Miles trainer
   -> Xyne backend :3103
   -> session proxy :18114
   -> Polar gateway :8101
-  -> Miles SGLang router http://192.168.111.7:30100
+  -> SGLang router http://100.64.0.149:30100
   -> RTX2 GPUs 4-7 (two TP2 engines)
 
 Xyne tools -> Postgres 127.0.0.1:15432 and Vespa 127.0.0.1:18080/18081
@@ -95,11 +95,11 @@ At minimum, provide:
 
 The defaults encode the current lane endpoints:
 
-- Xyne test backend: `http://localhost:3103`
-- Polar rollout: `http://127.0.0.1:8081`
-- Polar gateway: `http://127.0.0.1:8101`
-- Session proxy: `http://127.0.0.1:18114`
-- Judge/model endpoint: `http://192.168.111.7:30100/v1`
+- Xyne test backend: `http://100.64.0.126:3103`
+- Polar rollout: `http://100.64.0.126:8081`
+- Polar gateway: `http://100.64.0.126:8101`
+- Session proxy: `http://100.64.0.126:18114`
+- Judge/model endpoint: `http://100.64.0.149:30100/v1`
 
 Before launching, run:
 

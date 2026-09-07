@@ -3,12 +3,17 @@
 ## Service health
 
 ```bash
+make expose-rtx1-tailscale
 ./scripts/servers/check_stack.sh
-curl -s http://127.0.0.1:8081/health
-curl -s http://127.0.0.1:8101/health
-curl -s http://127.0.0.1:18114/health
-curl -s http://127.0.0.1:30100/health
+curl -s http://100.64.0.126:8081/health
+curl -s http://100.64.0.126:8101/health
+curl -s http://100.64.0.126:18114/health
+curl -s http://100.64.0.149:30100/health
 ```
+
+`make expose-rtx1-tailscale` is safe for an active rollout: it only starts
+missing `socat` proxies for RTX1's loopback-only Polar rollout, gateway, and
+session proxy. It never restarts or stops those services.
 
 ## Ray job status
 

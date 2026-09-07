@@ -2,7 +2,7 @@
 # source trees in this repository. The base image carries the heavy CUDA,
 # Megatron, SGLang, and Ray dependencies; this overlay carries our current
 # Miles/Polar changes and reproducible launch contracts.
-ARG BASE_IMAGE=radixark/miles:latest
+ARG BASE_IMAGE=radixark/miles@sha256:08be00658cd24eaa364ca4ad0b1a3911dfbe4adc04fd0c148e4241402fb40812
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="agentic-rl Miles overlay"

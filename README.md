@@ -46,6 +46,13 @@ cp .env.example .env
 # Fill local credentials; never commit .env.
 ```
 
+Or use the bootstrap target, which creates the virtualenv, installs the
+development dependencies, and prepares a private `.env` from the template:
+
+```bash
+make bootstrap
+```
+
 Run the lightweight checks:
 
 ```bash
@@ -71,6 +78,12 @@ scripts/setup_miles_container.sh --host tata06 --gpus 0,1,2,3
 ```
 
 The equivalent Make target is `make setup-miles-tata06`.
+
+For any other SSH-reachable GPU host, use:
+
+```bash
+make setup-miles-remote MILES_REMOTE_HOST=neysa03 MILES_REMOTE_GPUS=0,1,2,3
+```
 
 The full GPU runtime also needs Docker, CUDA, PyTorch, Ray, Megatron,
 Transformer Engine, SGLang, Bun, Vespa, and Postgres from the target RTX
@@ -110,9 +123,11 @@ Miles actor update
 SGLang inference
 ```
 
-The current lane's non-secret endpoints are Xyne `:3103`, Polar rollout
-`:8081`, Polar gateway `:8101`, session proxy `:18114`, and the Miles-managed
-SGLang router at `http://192.168.111.7:30100` from RTX1.
+The current cross-node lane uses RTX1's Tailscale address for Polar and Xyne:
+Xyne `http://100.64.0.126:3103`, Polar rollout
+`http://100.64.0.126:8081`, Polar gateway `http://100.64.0.126:8101`,
+session proxy `http://100.64.0.126:18114`, and SGLang on RTX2 at
+`http://100.64.0.149:30100`.
 
 ## Documentation
 
