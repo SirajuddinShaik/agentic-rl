@@ -307,15 +307,28 @@ class UpdateWeightFromTensor:
             refs, long_lived_tensors = self._send_lora_params(accumulated_named_tensors)
             results = ray.get(refs)
             _check_weight_sync_results(results, is_lora=True)
-            del long_lived_tensors
-            del accumulated_named_tensors
-            torch.cuda.ipc_collect()
-            torch.cuda.empty_cache()
 
             if not self._lora_base_synced:
                 self._lora_base_synced = True
 
+            logger.info(
+                "rank %s LoRA adapter load completed; waiting for distributed barrier",
+                dist.get_rank(),
+            )
+            # Keep producer-side CUDA tensors alive until every rank has
+            # finished loading the adapter. SGLang copies the IPC tensors to
+            # CPU before returning, but eagerly calling ipc_collect/empty_cache
+            # while cross-process handles are being torn down can segfault the
+            # gather-source rank on colocated TP=8 H200 runs.
         dist.barrier(group=get_gloo_group())
+
+        # Release only after all ranks and the rollout engine have completed
+        # the LoRA load. The normal tensor destructor releases producer storage
+        # without forcing CUDA IPC collection underneath consumers.
+        if self.is_lora:
+            del long_lived_tensors
+            del accumulated_named_tensors
+            logger.info("rank %s LoRA producer tensors released", dist.get_rank())
 
         if rank == 0:
             from .polar_inference_gate import resume_polar_inference

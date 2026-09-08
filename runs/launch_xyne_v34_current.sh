@@ -24,7 +24,7 @@ POLAR_CONFIG_TEMPLATE="${POLAR_CONFIG_TEMPLATE:-${REPO_ROOT}/configs/polar/polar
 CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${RUN_DIR}/polar_config_custom.yaml}"
 WANDB_DIR="${WANDB_DIR:-${PROJECT_ROOT}/tmp/wandb}"
 
-: "${LOAD_DIR:?Set LOAD_DIR to a completed checkpoint, e.g. .../iter_0000001}"
+LOAD_DIR="${LOAD_DIR:-}"
 : "${HF_CHECKPOINT:?Set HF_CHECKPOINT}"
 : "${PROMPT_DATA:?Set PROMPT_DATA}"
 : "${AGENT_CLI_DIR:?Set AGENT_CLI_DIR}"
@@ -162,7 +162,12 @@ echo "RUN_ID=${RUN_ID}"
 echo "RUN_DIR=${RUN_DIR}"
 echo "SAVE_DIR=${SAVE_DIR}"
 echo "TRAJECTORY_DUMP_DIR=${TRAJECTORY_DUMP_DIR}"
-echo "LOAD_DIR=${LOAD_DIR}"
+echo "LOAD_DIR=${LOAD_DIR:-<fresh-base-from-HF>}"
+
+LOAD_ARGS=()
+if [[ -n "${LOAD_DIR}" ]]; then
+  LOAD_ARGS+=(--load "${LOAD_DIR}")
+fi
 
 exec "${PYTHON_BIN}" "${PROJECT_ROOT}/train_async_microbatch_v2.py" \
   --actor-num-nodes 1 \
@@ -181,7 +186,7 @@ exec "${PYTHON_BIN}" "${PROJECT_ROOT}/train_async_microbatch_v2.py" \
   --hf-checkpoint "${HF_CHECKPOINT}" \
   --no-load-optim --no-load-rng --finetune --megatron-to-hf-mode bridge \
   --save "${SAVE_DIR}" --save-interval 1 \
-  --load "${LOAD_DIR}" \
+  "${LOAD_ARGS[@]}" \
   --rollout-function-path miles.rollout.polar_rollout.generate_rollout_polar_async_microbatch \
   --custom-rm-path miles.rollout.polar_reward.custom_rm \
   --custom-reward-post-process-path miles.rollout.polar_reward.post_process_rewards \

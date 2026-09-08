@@ -30,7 +30,10 @@ class InfoActor:
 
 def sort_key(x):
     index, node_identifier, gpu_id = x
-    # Sort by node IP number and then by GPU ID
+    # Put the Ray head node first so the trainer gets the head's full GPU set,
+    # then sort remaining worker nodes by IP and GPU ID.
+    head_ip = ray.util.get_node_ip_address()
+    is_head = 0 if node_identifier == head_ip else 1
     try:
         # try to parse it as an IP address.
         ip_address = node_identifier
@@ -46,7 +49,7 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
-    return (node_ip_parts, gpu_id)
+    return (is_head, node_ip_parts, gpu_id)
 
 
 def _create_placement_group(num_gpus):

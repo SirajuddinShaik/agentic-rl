@@ -1,0 +1,19 @@
+diff --git a/python/sglang/jit_kernel/per_tensor_quant_fp8.py b/python/sglang/jit_kernel/per_tensor_quant_fp8.py
+index 40aee26..5378230 100644
+--- a/python/sglang/jit_kernel/per_tensor_quant_fp8.py
++++ b/python/sglang/jit_kernel/per_tensor_quant_fp8.py
+@@ -42,7 +42,7 @@ def per_tensor_quant_fp8(
+         is_static: If True, assumes scale is pre-computed and skips absmax computation
+     """
+     module = _jit_per_tensor_quant_fp8_module(is_static, input.dtype)
+-    module.per_tensor_quant_fp8(input.view(-1), output_q.view(-1), output_s.view(-1))
++    module.per_tensor_quant_fp8(input.reshape(-1), output_q.reshape(-1), output_s.reshape(-1))
+ 
+ 
+ @cache_once
+@@ -74,4 +74,4 @@ def per_tensor_absmax_fp8(
+         output_s: Pre-allocated float32 tensor of shape (1,), zero-initialised.
+     """
+     module = _jit_per_tensor_absmax_fp8_module(input.dtype)
+-    module.per_tensor_absmax_fp8(input.view(-1), output_s.view(-1))
++    module.per_tensor_absmax_fp8(input.reshape(-1), output_s.reshape(-1))
